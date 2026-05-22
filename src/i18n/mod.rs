@@ -192,6 +192,7 @@ pub struct I18nStrings {
     pub preferences_shortcut_open_file: String,
     pub preferences_shortcut_quit_application: String,
     pub preferences_shortcut_dismiss_transient_ui: String,
+    pub preferences_shortcut_toggle_view_mode: String,
     /// Title of the link-opening confirmation prompt.
     pub open_link_title: String,
     /// Confirm button for the link-opening prompt.
@@ -361,6 +362,7 @@ struct I18nStringsDe {
     preferences_shortcut_open_file: Option<String>,
     preferences_shortcut_quit_application: Option<String>,
     preferences_shortcut_dismiss_transient_ui: Option<String>,
+    preferences_shortcut_toggle_view_mode: Option<String>,
     open_link_title: Option<String>,
     open_link_open: Option<String>,
     open_link_cancel: Option<String>,
@@ -500,6 +502,7 @@ const I18N_STRING_KEYS: &[&str] = &[
     "preferences_shortcut_open_file",
     "preferences_shortcut_quit_application",
     "preferences_shortcut_dismiss_transient_ui",
+    "preferences_shortcut_toggle_view_mode",
     "open_link_title",
     "open_link_open",
     "open_link_cancel",
@@ -817,6 +820,9 @@ impl I18nStringsDe {
             preferences_shortcut_dismiss_transient_ui: self
                 .preferences_shortcut_dismiss_transient_ui
                 .unwrap_or(defaults.preferences_shortcut_dismiss_transient_ui),
+            preferences_shortcut_toggle_view_mode: self
+                .preferences_shortcut_toggle_view_mode
+                .unwrap_or(defaults.preferences_shortcut_toggle_view_mode),
             open_link_title: self.open_link_title.unwrap_or(defaults.open_link_title),
             open_link_open: self.open_link_open.unwrap_or(defaults.open_link_open),
             open_link_cancel: self.open_link_cancel.unwrap_or(defaults.open_link_cancel),
@@ -1021,6 +1027,7 @@ impl I18nStrings {
             preferences_shortcut_open_file: "打开文件".into(),
             preferences_shortcut_quit_application: "退出应用".into(),
             preferences_shortcut_dismiss_transient_ui: "关闭临时界面".into(),
+            preferences_shortcut_toggle_view_mode: "切换视图模式".into(),
             open_link_title: "打开链接？".into(),
             open_link_open: "打开".into(),
             open_link_cancel: "取消".into(),
@@ -1175,6 +1182,7 @@ impl I18nStrings {
             preferences_shortcut_open_file: "Open File".into(),
             preferences_shortcut_quit_application: "Quit Application".into(),
             preferences_shortcut_dismiss_transient_ui: "Dismiss Temporary UI".into(),
+            preferences_shortcut_toggle_view_mode: "Toggle View Mode".into(),
             open_link_title: "Open link?".into(),
             open_link_open: "Open".into(),
             open_link_cancel: "Cancel".into(),

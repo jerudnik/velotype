@@ -53,6 +53,7 @@ actions!(
         CheckForUpdates,
         ShowAbout,
         DismissTransientUi,
+        ToggleViewMode,
     ]
 );
 
@@ -127,6 +128,7 @@ pub(crate) enum ShortcutCommand {
     OpenFile,
     QuitApplication,
     DismissTransientUi,
+    ToggleViewMode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -358,6 +360,13 @@ const SHORTCUT_DEFINITIONS: &[ShortcutDefinition] = &[
         default_keys: &["escape"],
         context: None,
     },
+    ShortcutDefinition {
+        command: ShortcutCommand::ToggleViewMode,
+        id: "toggle_view_mode",
+        category: ShortcutCategory::Navigation,
+        default_keys: &["ctrl-tab", "cmd-tab"],
+        context: None,
+    },
 ];
 
 pub(crate) fn shortcut_definitions() -> &'static [ShortcutDefinition] {
@@ -524,6 +533,7 @@ fn key_binding_for(
         ShortcutCommand::OpenFile => KeyBinding::new(key, OpenFile, context),
         ShortcutCommand::QuitApplication => KeyBinding::new(key, QuitApplication, context),
         ShortcutCommand::DismissTransientUi => KeyBinding::new(key, DismissTransientUi, context),
+        ShortcutCommand::ToggleViewMode => KeyBinding::new(key, ToggleViewMode, context),
     }
 }
 
@@ -572,6 +582,14 @@ mod tests {
         assert_eq!(
             resolved_shortcut_keys(&config, ShortcutCommand::SaveDocument),
             vec!["ctrl-alt-s".to_string()]
+        );
+    }
+
+    #[test]
+    fn toggle_view_mode_has_default_shortcuts() {
+        assert_eq!(
+            resolved_shortcut_keys(&BTreeMap::new(), ShortcutCommand::ToggleViewMode),
+            vec!["ctrl-tab".to_string(), "cmd-tab".to_string()]
         );
     }
 

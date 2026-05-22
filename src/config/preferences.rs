@@ -782,6 +782,9 @@ impl PreferencesWindow {
             ShortcutCommand::DismissTransientUi => {
                 strings.preferences_shortcut_dismiss_transient_ui.clone()
             }
+            ShortcutCommand::ToggleViewMode => {
+                strings.preferences_shortcut_toggle_view_mode.clone()
+            }
         }
     }
 

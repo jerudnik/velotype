@@ -11,10 +11,89 @@ use gpui::*;
 
 use super::Editor;
 use crate::components::{
-    BlockEvent, BlockKind, BlockRecord, CollapsedCaretAffinity, InlineTextTree, TableCellPosition,
+    BlockEvent, BlockKind, BlockRecord, CollapsedCaretAffinity, IndentBlock, InlineTextTree,
+    OutdentBlock, TableCellPosition,
 };
 
 impl Editor {
+    fn focused_block_for_tab_key(
+        &self,
+        window: &mut Window,
+        cx: &App,
+    ) -> Option<Entity<super::Block>> {
+        let is_focused = |block: &Entity<super::Block>| {
+            let block = block.read(cx);
+            block.focus_handle.is_focused(window)
+                || block.code_language_focus_handle.is_focused(window)
+        };
+
+        if let Some(block) = self
+            .active_entity_id
+            .and_then(|entity_id| self.focusable_entity_by_id(entity_id))
+            .filter(is_focused)
+        {
+            return Some(block);
+        }
+
+        for binding in self.table_cells.values() {
+            if is_focused(&binding.cell) {
+                return Some(binding.cell.clone());
+            }
+        }
+
+        self.document
+            .visible_blocks()
+            .iter()
+            .find_map(|visible| is_focused(&visible.entity).then(|| visible.entity.clone()))
+    }
+
+    pub(crate) fn on_editor_key_down_capture(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key != "tab" {
+            return;
+        }
+
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control || modifiers.platform || modifiers.alt || modifiers.function {
+            return;
+        }
+
+        let Some(target) = self.focused_block_for_tab_key(window, cx) else {
+            return;
+        };
+
+        let handles_tab = {
+            let block = target.read(cx);
+            if block.code_language_focus_handle.is_focused(window) {
+                cx.stop_propagation();
+                return;
+            }
+            block.is_table_cell()
+                || block.kind().is_list_item()
+                || block.kind() == BlockKind::Paragraph
+                || block.kind().is_code_block()
+        };
+
+        if !handles_tab {
+            return;
+        }
+
+        if modifiers.shift {
+            target.update(cx, |block, block_cx| {
+                block.on_outdent_block(&OutdentBlock, window, block_cx);
+            });
+        } else {
+            target.update(cx, |block, block_cx| {
+                block.on_indent_block(&IndentBlock, window, block_cx);
+            });
+        }
+        cx.stop_propagation();
+    }
+
     fn build_plain_paste_blocks_from_lines(
         cx: &mut Context<Self>,
         lines: &[String],

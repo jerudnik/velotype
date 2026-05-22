@@ -1479,6 +1479,7 @@ impl Block {
             .on_action(cx.listener(Self::on_cut))
             .on_action(cx.listener(Self::on_paste))
             .on_action(cx.listener(Self::on_exit_code_block))
+            .on_key_down(cx.listener(Self::on_block_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1913,6 +1914,7 @@ impl Render for Block {
                 .into_any_element(),
             BlockKind::TaskListItem { checked } => {
                 let marker_width = d.list_marker_width.max(d.task_checkbox_size);
+                let first_line_height = t.text_size * t.text_line_height;
                 focused_base
                     .text_size(px(t.text_size))
                     .text_color(c.text_default)
@@ -1925,7 +1927,9 @@ impl Render for Block {
                     .children([
                         div()
                             .min_w(px(marker_width))
-                            .pt(px(d.block_padding_y.max(1.0)))
+                            .h(px(first_line_height))
+                            .flex()
+                            .items_center()
                             .child(
                                 div()
                                     .size(px(d.task_checkbox_size))

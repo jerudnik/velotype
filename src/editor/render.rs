@@ -1749,6 +1749,7 @@ impl Render for Editor {
             .capture_action(cx.listener(Self::on_cut_capture))
             .capture_action(cx.listener(Self::on_delete_capture))
             .capture_action(cx.listener(Self::on_delete_back_capture))
+            .capture_key_down(cx.listener(Self::on_editor_key_down_capture))
             .can_drop(|dragged, _window, _cx| dragged.is::<ExternalPaths>())
             .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
             .on_action(cx.listener(Self::on_undo))
@@ -1757,6 +1758,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_export_html))
             .on_action(cx.listener(Self::on_export_pdf))
             .on_action(cx.listener(Self::on_quit_application))
+            .on_action(cx.listener(Self::on_toggle_view_mode_action))
             .on_action(cx.listener(Self::on_dismiss_transient_ui));
         let base = if let Some(menu_bar) = self.render_in_window_menu_bar(&theme, cx) {
             base.child(menu_bar)

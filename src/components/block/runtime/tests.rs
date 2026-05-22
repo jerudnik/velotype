@@ -10,7 +10,7 @@ use crate::components::markdown::inline::{
     InlineTextTree,
 };
 use crate::components::markdown::link::parse_link_reference_definitions;
-use crate::components::{Block, BlockKind, BlockRecord, Newline, TableCellPosition};
+use crate::components::{Block, BlockKind, BlockRecord, IndentBlock, Newline, TableCellPosition};
 use crate::i18n::I18nManager;
 use crate::theme::ThemeManager;
 use gpui::{
@@ -26,6 +26,47 @@ fn assert_only_code_range(block: &Block, expected: Range<usize>) {
         .map(|span| span.range.clone())
         .collect::<Vec<_>>();
     assert_eq!(code_ranges, vec![expected]);
+}
+
+#[gpui::test]
+async fn tab_inserts_character_in_paragraph(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    let block = cx.new(|cx| Block::with_record(cx, BlockRecord::paragraph("ab")));
+
+    cx.update(|window, cx| {
+        block.update(cx, |block, block_cx| {
+            block.move_to(1, block_cx);
+            block.on_indent_block(&IndentBlock, window, block_cx);
+        });
+    });
+
+    block.read_with(cx, |block, _cx| {
+        assert_eq!(block.display_text(), "a    b");
+        assert_eq!(block.selected_range, 5..5);
+    });
+}
+
+#[gpui::test]
+async fn tab_inserts_character_in_code_block(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    let block = cx.new(|cx| {
+        Block::with_record(
+            cx,
+            BlockRecord::with_plain_text(BlockKind::CodeBlock { language: None }, "ab"),
+        )
+    });
+
+    cx.update(|window, cx| {
+        block.update(cx, |block, block_cx| {
+            block.move_to(1, block_cx);
+            block.on_indent_block(&IndentBlock, window, block_cx);
+        });
+    });
+
+    block.read_with(cx, |block, _cx| {
+        assert_eq!(block.display_text(), "a    b");
+        assert_eq!(block.selected_range, 5..5);
+    });
 }
 
 #[test]

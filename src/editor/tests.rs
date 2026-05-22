@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui::{AnyWindowHandle, AppContext, TestAppContext, VisualTestContext};
+use gpui::{
+    AnyWindowHandle, AppContext, KeyDownEvent, Keystroke, TestAppContext, VisualTestContext,
+};
 
 use super::{Editor, ViewMode};
 use crate::components::{
@@ -2076,6 +2078,211 @@ async fn toggle_view_mode_ends_stale_code_block_pointer_selection(cx: &mut TestA
             assert!(!block.code_language_is_selecting);
             assert_eq!(block.selected_range, 3..7);
         });
+    });
+}
+
+#[gpui::test]
+async fn ctrl_tab_toggles_view_mode(cx: &mut TestAppContext) {
+    init_editor_test_app(cx);
+    let (editor, mut cx) =
+        cx.add_window_view(|_window, cx| Editor::from_markdown(cx, "alpha".to_string(), None));
+
+    redraw(&mut cx);
+    cx.simulate_keystrokes("ctrl-tab");
+    redraw(&mut cx);
+
+    editor.update(cx, |editor, _cx| {
+        assert!(matches!(editor.view_mode, ViewMode::Source));
+    });
+
+    cx.simulate_keystrokes("ctrl-tab");
+    redraw(&mut cx);
+
+    editor.update(cx, |editor, _cx| {
+        assert!(matches!(editor.view_mode, ViewMode::Rendered));
+    });
+}
+
+#[gpui::test]
+async fn tab_key_inserts_tab_in_focused_paragraph(cx: &mut TestAppContext) {
+    init_editor_test_app(cx);
+    let (editor, mut cx) =
+        cx.add_window_view(|_window, cx| Editor::from_markdown(cx, "ab".to_string(), None));
+
+    editor.update(cx, |editor, cx| {
+        let block = editor.document.visible_blocks()[0].entity.clone();
+        editor.focus_block(block.entity_id());
+        block.update(cx, |block, block_cx| {
+            block.move_to(1, block_cx);
+        });
+    });
+    redraw(&mut cx);
+
+    cx.simulate_keystrokes("tab");
+    redraw(&mut cx);
+
+    editor.update(cx, |editor, cx| {
+        let block = editor.document.visible_blocks()[0].entity.clone();
+        assert_eq!(block.read(cx).display_text(), "a    b");
+        assert_eq!(editor.document.markdown_text(cx), "a    b");
+    });
+}
+
+#[gpui::test]
+async fn tab_key_inserts_tab_in_focused_code_block(cx: &mut TestAppContext) {
+    init_editor_test_app(cx);
+    let (editor, mut cx) = cx.add_window_view(|_window, cx| {
+        Editor::from_markdown(cx, "```rust\nab\n```".to_string(), None)
+    });
+
+    editor.update(cx, |editor, cx| {
+        let block = editor.document.visible_blocks()[0].entity.clone();
+        editor.focus_block(block.entity_id());
+        block.update(cx, |block, block_cx| {
+            block.move_to(1, block_cx);
+        });
+    });
+    redraw(&mut cx);
+
+    cx.simulate_keystrokes("tab");
+    redraw(&mut cx);
+
+    editor.update(cx, |editor, cx| {
+        let block = editor.document.visible_blocks()[0].entity.clone();
+        assert_eq!(block.read(cx).display_text(), "a    b");
+        assert_eq!(editor.document.markdown_text(cx), "```rust\na    b\n```");
+    });
+}
+
+#[gpui::test]
+async fn captured_tab_key_inserts_visible_indent_in_paragraph(cx: &mut TestAppContext) {
+    init_editor_test_app(cx);
+    let (editor, mut cx) =
+        cx.add_window_view(|_window, cx| Editor::from_markdown(cx, "ab".to_string(), None));
+
+    editor.update(cx, |editor, cx| {
+        let block = editor.document.visible_blocks()[0].entity.clone();
+        editor.focus_block(block.entity_id());
+        block.update(cx, |block, block_cx| {
+            block.move_to(1, block_cx);
+        });
+    });
+    redraw(&mut cx);
+
+    let event = KeyDownEvent {
+        keystroke: Keystroke::parse("tab").expect("valid tab keystroke"),
+        is_held: false,
+    };
+    editor.update_in(cx, |editor, window, cx| {
+        editor.on_editor_key_down_capture(&event, window, cx);
+    });
+    redraw(&mut cx);
+
+    editor.update(cx, |editor, cx| {
+        let block = editor.document.visible_blocks()[0].entity.clone();
+        assert_eq!(block.read(cx).display_text(), "a    b");
+    });
+}
+
+#[gpui::test]
+async fn captured_tab_key_does_not_modify_code_language_input(cx: &mut TestAppContext) {
+    init_editor_test_app(cx);
+    let (editor, mut cx) = cx.add_window_view(|_window, cx| {
+        Editor::from_markdown(cx, "```rust\nab\n```".to_string(), None)
+    });
+
+    editor.update_in(cx, |editor, window, cx| {
+        let block = editor.document.visible_blocks()[0].entity.clone();
+        editor.focus_block(block.entity_id());
+        block.update(cx, |block, block_cx| {
+            block.move_to(1, block_cx);
+        });
+        block.update(cx, |block, _cx| {
+            block.code_language_focus_handle.focus(window);
+        });
+    });
+    redraw(&mut cx);
+
+    editor.update_in(cx, |editor, window, cx| {
+        let block = editor.document.visible_blocks()[0].entity.clone();
+        block.update(cx, |block, _cx| {
+            block.code_language_focus_handle.focus(window);
+        });
+    });
+
+    let event = KeyDownEvent {
+        keystroke: Keystroke::parse("tab").expect("valid tab keystroke"),
+        is_held: false,
+    };
+    editor.update_in(cx, |editor, window, cx| {
+        editor.on_editor_key_down_capture(&event, window, cx);
+    });
+    redraw(&mut cx);
+
+    editor.update(cx, |editor, cx| {
+        let block = editor.document.visible_blocks()[0].entity.clone();
+        let block = block.read(cx);
+        assert_eq!(block.code_language_text(), "rust");
+        assert_eq!(block.display_text(), "ab");
+    });
+}
+
+#[gpui::test]
+async fn tab_key_keeps_list_indent_semantics(cx: &mut TestAppContext) {
+    init_editor_test_app(cx);
+    let (editor, mut cx) =
+        cx.add_window_view(|_window, cx| Editor::from_markdown(cx, "- a\n- b".to_string(), None));
+
+    editor.update(cx, |editor, cx| {
+        let second = editor.document.visible_blocks()[1].entity.clone();
+        editor.focus_block(second.entity_id());
+        second.update(cx, |block, block_cx| {
+            block.move_to(block.visible_len(), block_cx);
+        });
+    });
+    redraw(&mut cx);
+
+    cx.simulate_keystrokes("tab");
+    redraw(&mut cx);
+
+    editor.update(cx, |editor, cx| {
+        let visible = editor.document.visible_blocks();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[1].entity.read(cx).render_depth, 1);
+        assert_eq!(editor.document.markdown_text(cx), "- a\n  - b");
+    });
+}
+
+#[gpui::test]
+async fn tab_key_keeps_table_cell_navigation(cx: &mut TestAppContext) {
+    init_editor_test_app(cx);
+    let markdown = ["| A | B |", "| --- | --- |", "| 1 | 2 |"].join("\n");
+    let (editor, mut cx) =
+        cx.add_window_view(move |_window, cx| Editor::from_markdown(cx, markdown, None));
+
+    let second_cell_id = editor.update(cx, |editor, cx| {
+        let table = editor.document.first_root().expect("table root").clone();
+        let runtime = table
+            .read(cx)
+            .table_runtime
+            .as_ref()
+            .expect("table runtime")
+            .clone();
+        let first = runtime.rows[0][0].clone();
+        let second = runtime.rows[0][1].clone();
+        editor.focus_block(first.entity_id());
+        first.update(cx, |block, block_cx| {
+            block.move_to(block.visible_len(), block_cx);
+        });
+        second.entity_id()
+    });
+    redraw(&mut cx);
+
+    cx.simulate_keystrokes("tab");
+    redraw(&mut cx);
+
+    editor.update(cx, |editor, _cx| {
+        assert_eq!(editor.active_entity_id, Some(second_cell_id));
     });
 }
 

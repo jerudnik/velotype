@@ -740,12 +740,10 @@ fn collect_fenced_code_block(
         ));
     }
 
-    let mut code_lines = Vec::new();
-    let mut content_index = start + 1;
-    while content_index < closing_index {
-        code_lines.push(lines[content_index].clone());
-        content_index += 1;
-    }
+    // Length is known: closing_index - (start + 1). slice.to_vec()
+    // allocates the exact capacity in one shot, vs Vec::new() + while-push
+    // which doubles the buffer 2-3 times for any non-trivial code block.
+    let code_lines = lines[start + 1..closing_index].to_vec();
 
     Some((
         build_code_block(cx, fence.language.clone(), code_lines.join("\n")),

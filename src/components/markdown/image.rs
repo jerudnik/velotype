@@ -598,7 +598,7 @@ fn parse_image_target(inner: &str) -> Option<(String, Option<String>)> {
         if !is_escaped(inner, close_quote)
             && let Some(open_quote) = find_open_title_quote(inner, close_quote)
         {
-            let src = inner[..open_quote.saturating_sub(1)].trim_end().to_string();
+            let src = inner[..open_quote.saturating_sub(1)].trim_end();
             let title = inner[open_quote + 1..close_quote].to_string();
             if src.is_empty() {
                 return None;
@@ -607,7 +607,7 @@ fn parse_image_target(inner: &str) -> Option<(String, Option<String>)> {
         }
     }
 
-    Some((normalize_image_source(inner.to_string()), None))
+    Some((normalize_image_source(inner), None))
 }
 
 fn is_reference_definition_title_continuation(line: &str) -> bool {
@@ -636,8 +636,8 @@ fn find_open_title_quote(input: &str, close_quote: usize) -> Option<usize> {
     })
 }
 
-fn normalize_image_source(source: String) -> String {
-    let source = unescape_ascii_punctuation(&source);
+fn normalize_image_source(source: &str) -> String {
+    let source = unescape_ascii_punctuation(source);
     if source.starts_with('<')
         && source.ends_with('>')
         && Uri::from_str(&source[1..source.len() - 1]).is_ok()

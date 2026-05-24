@@ -148,6 +148,10 @@ harness = false
 name = "exporter_inline_walker"
 harness = false
 
+[[bench]]
+name = "borrowed_str_params"
+harness = false
+
 # Stop Cargo from also linking the libtest bench harness against the bin —
 # without this, Criterion-specific CLI flags (`--save-baseline`, etc.) trip
 # the libtest stub before Criterion's `main` runs (rust-lang/rust#47241).

@@ -338,7 +338,7 @@ pub(crate) fn parse_link_target(inner: &str) -> Option<(String, Option<String>)>
         if !is_escaped(inner, close_quote)
             && let Some(open_quote) = find_open_title_quote(inner, close_quote)
         {
-            let destination = inner[..open_quote.saturating_sub(1)].trim_end().to_string();
+            let destination = inner[..open_quote.saturating_sub(1)].trim_end();
             let title = inner[open_quote + 1..close_quote].to_string();
             if destination.is_empty() {
                 return None;
@@ -347,11 +347,11 @@ pub(crate) fn parse_link_target(inner: &str) -> Option<(String, Option<String>)>
         }
     }
 
-    Some((normalize_link_destination(inner.to_string()), None))
+    Some((normalize_link_destination(inner), None))
 }
 
-fn normalize_link_destination(destination: String) -> String {
-    let destination = unescape_ascii_punctuation(&destination);
+fn normalize_link_destination(destination: &str) -> String {
+    let destination = unescape_ascii_punctuation(destination);
     if destination.starts_with('<')
         && destination.ends_with('>')
         && is_supported_autolink_target(&destination[1..destination.len() - 1])

@@ -61,8 +61,9 @@ fn build_text_runs(
     code_bg: Hsla,
     show_inline_code_backgrounds: bool,
 ) -> Vec<TextRun> {
+    let spans = input.inline_spans();
     let mut boundaries = vec![0, display_text.len()];
-    for span in input.inline_spans() {
+    for span in spans {
         boundaries.push(span.range.start);
         boundaries.push(span.range.end);
     }
@@ -73,8 +74,9 @@ fn build_text_runs(
     boundaries.sort_unstable();
     boundaries.dedup();
 
-    let marked_range = input.marked_range.clone();
+    let marked_range = input.marked_range.as_ref();
     let mut runs = Vec::new();
+    let mut span_idx = 0usize;
     for boundary_pair in boundaries.windows(2) {
         let start = boundary_pair[0];
         let end = boundary_pair[1];
@@ -82,12 +84,20 @@ fn build_text_runs(
             continue;
         }
 
-        let inline_style = input.inline_style_at(start);
-        let html_style = input.inline_html_style_at(start);
-        let is_link = input.inline_link_at(start).is_some();
-        let is_footnote = input.inline_footnote_hit_at(start).is_some();
+        // Spans are stored in ascending order and boundaries are sorted, so
+        // we can advance a single index instead of re-scanning per boundary.
+        while span_idx < spans.len() && spans[span_idx].range.end <= start {
+            span_idx += 1;
+        }
+        let active_span = spans
+            .get(span_idx)
+            .filter(|span| span.range.start <= start && start < span.range.end);
+
+        let inline_style = active_span.map(|s| s.style).unwrap_or_default();
+        let html_style = active_span.and_then(|s| s.html_style);
+        let is_link = active_span.map(|s| s.link.is_some()).unwrap_or(false);
+        let is_footnote = active_span.map(|s| s.footnote.is_some()).unwrap_or(false);
         let is_marked = marked_range
-            .as_ref()
             .map(|range| start < range.end && range.start < end)
             .unwrap_or(false);
 
@@ -168,12 +178,14 @@ fn build_code_text_runs(
     underline_thickness: Pixels,
     colors: &ThemeColors,
 ) -> Vec<TextRun> {
+    let highlight_spans = input
+        .code_highlight_result()
+        .map(|r| r.spans.as_slice())
+        .unwrap_or(&[]);
     let mut boundaries = vec![0, display_text.len()];
-    if let Some(highlight_result) = input.code_highlight_result() {
-        for span in &highlight_result.spans {
-            boundaries.push(span.range.start);
-            boundaries.push(span.range.end);
-        }
+    for span in highlight_spans {
+        boundaries.push(span.range.start);
+        boundaries.push(span.range.end);
     }
     if let Some(marked_range) = input.marked_range.as_ref() {
         boundaries.push(marked_range.start);
@@ -182,8 +194,9 @@ fn build_code_text_runs(
     boundaries.sort_unstable();
     boundaries.dedup();
 
-    let marked_range = input.marked_range.clone();
+    let marked_range = input.marked_range.as_ref();
     let mut runs = Vec::new();
+    let mut span_idx = 0usize;
     for boundary_pair in boundaries.windows(2) {
         let start = boundary_pair[0];
         let end = boundary_pair[1];
@@ -192,13 +205,15 @@ fn build_code_text_runs(
         }
 
         let is_marked = marked_range
-            .as_ref()
             .map(|range| start < range.end && range.start < end)
             .unwrap_or(false);
-        let run_color = input
-            .code_highlight_result()
-            .and_then(|result| result.class_at(start))
-            .map(|class| code_highlight_color(colors, class))
+        while span_idx < highlight_spans.len() && highlight_spans[span_idx].range.end <= start {
+            span_idx += 1;
+        }
+        let run_color = highlight_spans
+            .get(span_idx)
+            .filter(|span| span.range.start <= start && start < span.range.end)
+            .map(|span| code_highlight_color(colors, span.class))
             .unwrap_or(base_run.color);
 
         runs.push(TextRun {

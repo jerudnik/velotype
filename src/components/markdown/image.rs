@@ -137,7 +137,7 @@ pub(crate) fn parse_standalone_image(markdown: &str) -> Option<ImageSyntax> {
     }
     let alt_end = alt_end?;
 
-    let alt = markdown[2..alt_end].to_string();
+    let alt = unescape_ascii_punctuation(&markdown[2..alt_end]);
     match bytes.get(alt_end + 1) {
         Some(b'(') if markdown.ends_with(')') => {
             let inner = &markdown[alt_end + 2..markdown.len() - 1];
@@ -232,7 +232,7 @@ fn parse_inline_image_at(markdown: &str, start: usize) -> Option<(String, ImageS
     }
 
     let alt_end = find_unescaped_char(markdown, start + 2, b']')?;
-    let alt = markdown[start + 2..alt_end].to_string();
+    let alt = unescape_ascii_punctuation(&markdown[start + 2..alt_end]);
     let next = markdown.as_bytes().get(alt_end + 1).copied();
 
     match next {
@@ -745,6 +745,23 @@ mod tests {
             parsed.target,
             ImageTarget::Direct {
                 src: "https://example.com/typera_picgo/img.png".to_string(),
+                title: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_standalone_image_with_underscores_in_alt_and_source() {
+        let parsed = parse_standalone_image(
+            "![1.1_进制转换例子](./NetworkEngineerSummer.assets/1.1_进制转换例子.jpg)",
+        )
+        .expect("image syntax");
+
+        assert_eq!(parsed.alt, "1.1_进制转换例子");
+        assert_eq!(
+            parsed.target,
+            ImageTarget::Direct {
+                src: "./NetworkEngineerSummer.assets/1.1_进制转换例子.jpg".to_string(),
                 title: None,
             }
         );

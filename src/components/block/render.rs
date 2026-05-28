@@ -12,8 +12,9 @@ use crate::components::{
     Editor, HtmlCssColor, HtmlDocument, HtmlNode, HtmlNodeKind, InlineScript, TableAxisHighlight,
     TableAxisKind, TableAxisMarker, TableCellInlineImageSegment, TableColumnLayout, attr_value,
     display_math_font_size, inline_math_font_size, parse_display_math_source,
-    parse_mermaid_fence_source, parse_table_cell_inline_images, render_display_math_svg,
-    render_inline_math_svg, render_mermaid_svg_for_display, resolve_image_source, style_for_node,
+    parse_html_image_block, parse_mermaid_fence_source, parse_table_cell_inline_images,
+    render_display_math_svg, render_inline_math_svg, render_mermaid_svg_for_display,
+    resolve_image_source, style_for_node,
 };
 use crate::i18n::{I18nManager, I18nStrings};
 use crate::theme::{Theme, ThemeDimensions, ThemeManager};
@@ -1307,7 +1308,13 @@ impl Block {
         node_style: HtmlNodeVisualStyle,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(src) = attr_value(node, "src").filter(|src| !src.trim().is_empty()) else {
+        let parsed_image = parse_html_image_block(&node.raw_source);
+        let src = parsed_image
+            .as_ref()
+            .map(|image| image.src.as_str())
+            .or_else(|| attr_value(node, "src"))
+            .filter(|src| !src.trim().is_empty());
+        let Some(src) = src else {
             let mut element = div()
                 .text_size(px(node_style.computed.font_size))
                 .text_color(node_style.computed.color)
@@ -1317,18 +1324,26 @@ impl Block {
             }
             return element.into_any_element();
         };
+        let alt = parsed_image
+            .as_ref()
+            .map(|image| image.alt.clone())
+            .unwrap_or_else(|| attr_value(node, "alt").unwrap_or_default().to_string());
+        let zoom = parsed_image
+            .as_ref()
+            .map(|image| image.zoom_factor())
+            .unwrap_or(1.0);
         let runtime = ImageRuntime {
-            alt: attr_value(node, "alt").unwrap_or_default().to_string(),
+            alt,
             src: src.to_string(),
-            title: attr_value(node, "title").map(str::to_string),
-            resolved_source: resolve_image_source(src, None),
+            title: None,
+            resolved_source: resolve_image_source(src, self.image_base_dir()),
         };
         let strings = cx.global::<I18nManager>().strings_arc();
         let content = self.render_image_content(
             &runtime,
-            Length::Definite(relative(1.0)),
-            px(theme.dimensions.image_root_max_height),
-            px(theme.dimensions.image_root_placeholder_height),
+            Length::Definite(relative(zoom)),
+            px(theme.dimensions.image_root_max_height * zoom),
+            px(theme.dimensions.image_root_placeholder_height * zoom),
             theme,
             &strings,
         );

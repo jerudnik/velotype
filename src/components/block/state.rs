@@ -10,6 +10,7 @@ use gpui::{Pixels, Point, SharedString};
 use uuid::Uuid;
 
 use crate::components::markdown::html::{HtmlDocument, parse_html_document};
+use crate::components::markdown::image::parse_standalone_image;
 use crate::components::markdown::inline::InlineTextTree;
 use crate::components::{TableAxisKind, TableData};
 
@@ -537,7 +538,7 @@ impl BlockRecord {
     /// Raw-preserved blocks produce their fallback text when at depth 0.
     pub fn markdown_line(&self, depth: usize, list_ordinal: Option<usize>) -> String {
         let indentation = "  ".repeat(depth);
-        let title_markdown = self.title_markdown();
+        let title_markdown = self.title_markdown_for_output();
         match self.kind {
             BlockKind::Paragraph => indent_multiline(&title_markdown, &indentation),
             BlockKind::Separator => "---".to_string(),
@@ -594,6 +595,27 @@ impl BlockRecord {
                 }
             }
         }
+    }
+
+    fn title_markdown_for_output(&self) -> String {
+        let visible = self.title.visible_text();
+        if self.can_present_title_as_standalone_image()
+            && parse_standalone_image(&visible).is_some()
+        {
+            return visible;
+        }
+
+        self.title_markdown()
+    }
+
+    fn can_present_title_as_standalone_image(&self) -> bool {
+        matches!(
+            self.kind,
+            BlockKind::Paragraph
+                | BlockKind::BulletedListItem
+                | BlockKind::NumberedListItem
+                | BlockKind::TaskListItem { .. }
+        )
     }
 
     fn sync_raw_fallback(&mut self) {
@@ -923,6 +945,14 @@ mod tests {
         assert_eq!(paragraph.markdown_line(1, None), "  plain");
         assert_eq!(comment.markdown_line(0, None), "<!--\ncomment\n-->");
         assert_eq!(comment.markdown_line(1, None), "  <!--\n  comment\n  -->");
+    }
+
+    #[test]
+    fn standalone_image_markdown_line_preserves_underscores() {
+        let markdown = "![1.1_进制转换例子](./NetworkEngineerSummer.assets/1.1_进制转换例子.jpg)";
+        let paragraph = BlockRecord::paragraph(markdown);
+
+        assert_eq!(paragraph.markdown_line(0, None), markdown);
     }
 
     #[test]

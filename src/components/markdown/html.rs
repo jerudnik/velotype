@@ -94,6 +94,36 @@ pub(crate) struct HtmlInlineStyle {
 
 impl Eq for HtmlInlineStyle {}
 
+/// Safe data extracted from a standalone HTML `<img>` block.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HtmlImageBlock {
+    pub(crate) src: String,
+    pub(crate) alt: String,
+    pub(crate) zoom: f32,
+}
+
+impl HtmlImageBlock {
+    pub(crate) fn zoom_factor(&self) -> f32 {
+        self.zoom.clamp(0.1, 3.0)
+    }
+
+    pub(crate) fn to_sanitized_html_with_src(&self, src: &str) -> String {
+        let mut html = format!("<img src=\"{}\"", escape_html_attr(src));
+        if !self.alt.is_empty() {
+            html.push_str(" alt=\"");
+            html.push_str(&escape_html_attr(&self.alt));
+            html.push('"');
+        }
+        if (self.zoom_factor() - 1.0).abs() > f32::EPSILON {
+            html.push_str(" style=\"zoom: ");
+            html.push_str(&css_number(self.zoom_factor() * 100.0));
+            html.push_str("%;\"");
+        }
+        html.push('>');
+        html
+    }
+}
+
 /// A classified HTML node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HtmlNode {
@@ -275,6 +305,10 @@ pub(crate) fn parse_html_document(raw_source: &str) -> HtmlDocument {
 /// their HTML shape, while raw text nodes are escaped so browsers cannot
 /// execute or interpret them.
 pub(crate) fn sanitize_html_for_export(raw_source: &str) -> String {
+    if let Some(image) = parse_html_image_block(raw_source) {
+        return image.to_sanitized_html_with_src(&image.src);
+    }
+
     let document = parse_html_document(raw_source);
     if !document.is_semantic() {
         return format!(
@@ -334,6 +368,12 @@ fn sanitize_node_for_export(node: &HtmlNode) -> String {
 }
 
 fn sanitized_open_tag(node: &HtmlNode) -> String {
+    if node.tag_name == "img"
+        && let Some(image) = parse_html_image_block(&node.raw_source)
+    {
+        return image.to_sanitized_html_with_src(&image.src);
+    }
+
     let mut open = format!("<{}", node.tag_name);
     for attr in &node.attrs {
         if attr.name == "style" {
@@ -734,6 +774,65 @@ pub(crate) fn attr_value<'a>(node: &'a HtmlNode, name: &str) -> Option<&'a str> 
         .and_then(|attr| attr.value.as_deref())
 }
 
+pub(crate) fn parse_html_image_block(raw_source: &str) -> Option<HtmlImageBlock> {
+    let trimmed = raw_source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let token = parse_tag_token(trimmed, 0)?;
+    if token.kind != TagKind::Open
+        || token.name != "img"
+        || token.source_range != (0..trimmed.len())
+    {
+        return None;
+    }
+    if has_dangerous_attrs(&token.attrs) {
+        return None;
+    }
+
+    let src = attr_value_in_attrs(&token.attrs, "src")?.trim().to_string();
+    if src.is_empty() {
+        return None;
+    }
+
+    let alt = attr_value_in_attrs(&token.attrs, "alt")
+        .unwrap_or_default()
+        .to_string();
+    let zoom = attr_value_in_attrs(&token.attrs, "style")
+        .and_then(parse_html_zoom)
+        .unwrap_or(1.0);
+
+    Some(HtmlImageBlock { src, alt, zoom })
+}
+
+fn attr_value_in_attrs<'a>(attrs: &'a [HtmlAttr], name: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|attr| attr.name == name)
+        .and_then(|attr| attr.value.as_deref())
+}
+
+pub(crate) fn parse_html_zoom(style: &str) -> Option<f32> {
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        if !property.trim().eq_ignore_ascii_case("zoom") {
+            continue;
+        }
+
+        let value = value.trim();
+        let parsed = if let Some(percent) = value.strip_suffix('%') {
+            parse_css_number(percent)? / 100.0
+        } else {
+            parse_css_number(value)?
+        };
+        return Some(parsed.clamp(0.1, 3.0));
+    }
+    None
+}
+
 pub(crate) fn parse_inline_style(style: &str) -> HtmlInlineStyle {
     let mut parsed = HtmlInlineStyle::default();
     for declaration in style.split(';') {
@@ -1085,6 +1184,39 @@ mod tests {
     fn dangerous_attribute_classifies_as_raw_text() {
         let doc = parse_html_document("<a href=\"javascript:alert(1)\">bad</a>");
         assert_eq!(doc.safety, HtmlSafetyClass::RawTextBlock);
+    }
+
+    #[test]
+    fn parses_standalone_html_image_block() {
+        let image = parse_html_image_block(
+            "<img src=\"./xxx/abc.png\" alt=\"alt text\" style=\"zoom:80%;\" />",
+        )
+        .expect("html image");
+
+        assert_eq!(image.src, "./xxx/abc.png");
+        assert_eq!(image.alt, "alt text");
+        assert_eq!(image.zoom, 0.8);
+    }
+
+    #[test]
+    fn html_image_zoom_ignores_other_style_declarations() {
+        let image = parse_html_image_block(
+            "<img src=\"a.png\" alt=\"a\" style=\"color:red; zoom: 120%; width:10px\" />",
+        )
+        .expect("html image");
+
+        assert_eq!(image.zoom, 1.2);
+        assert_eq!(
+            image.to_sanitized_html_with_src("a.png"),
+            "<img src=\"a.png\" alt=\"a\" style=\"zoom: 120%;\">"
+        );
+    }
+
+    #[test]
+    fn invalid_html_image_blocks_are_not_images() {
+        assert!(parse_html_image_block("<img alt=\"missing src\" />").is_none());
+        assert!(parse_html_image_block("<img src=\"\" />").is_none());
+        assert!(parse_html_image_block("<span><img src=\"x.png\" /></span>").is_none());
     }
 
     #[test]

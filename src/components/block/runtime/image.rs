@@ -36,12 +36,17 @@ impl Block {
         self.compute_image_runtime(self.image_base_dir.as_deref(), syntax)
     }
 
+    pub(crate) fn image_base_dir(&self) -> Option<&Path> {
+        self.image_base_dir.as_deref()
+    }
+
     pub(super) fn sync_image_runtime(&mut self) {
         let next_runtime = if self.can_present_as_image() {
-            let markdown = self.record.title.serialize_markdown();
-            parse_standalone_image(&markdown).and_then(|syntax| {
-                self.compute_image_runtime(self.image_base_dir.as_deref(), syntax)
-            })
+            self.standalone_image_markdown_for_runtime()
+                .and_then(|markdown| parse_standalone_image(&markdown))
+                .and_then(|syntax| {
+                    self.compute_image_runtime(self.image_base_dir.as_deref(), syntax)
+                })
         } else {
             None
         };
@@ -51,6 +56,18 @@ impl Block {
             self.image_expand_requested = false;
         }
         self.image_runtime = next_runtime;
+    }
+
+    fn standalone_image_markdown_for_runtime(&self) -> Option<String> {
+        let visible = self.record.title.visible_text();
+        if parse_standalone_image(&visible).is_some() {
+            return Some(visible);
+        }
+
+        let serialized = self.record.title.serialize_markdown();
+        parse_standalone_image(&serialized)
+            .is_some()
+            .then_some(serialized)
     }
 
     pub(crate) fn request_image_edit_expansion(&mut self) {

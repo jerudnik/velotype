@@ -1022,6 +1022,30 @@ async fn standalone_root_image_installs_runtime_and_resolves_relative_path(
 }
 
 #[gpui::test]
+async fn standalone_root_image_with_underscores_installs_runtime(cx: &mut TestAppContext) {
+    let markdown =
+        "![1.1_进制转换例子](./NetworkEngineerSummer.assets/1.1_进制转换例子.jpg)".to_string();
+    let file_path = PathBuf::from("D:/workspace/docs/note.md");
+    let editor = cx.new(|cx| Editor::from_markdown(cx, markdown.clone(), Some(file_path.clone())));
+
+    editor.read_with(cx, |editor, cx| {
+        let block = editor.document.first_root().expect("root block").clone();
+        let runtime = block.read(cx).image_runtime().expect("image runtime");
+        assert_eq!(runtime.alt, "1.1_进制转换例子");
+        assert_eq!(
+            runtime.resolved_source,
+            ImageResolvedSource::Local(
+                file_path
+                    .parent()
+                    .expect("file parent")
+                    .join("NetworkEngineerSummer.assets/1.1_进制转换例子.jpg")
+            )
+        );
+        assert_eq!(editor.document.markdown_text(cx), markdown);
+    });
+}
+
+#[gpui::test]
 async fn indented_root_images_install_runtime_before_indented_code(cx: &mut TestAppContext) {
     let url1 = "https://gitee.com/jikeyang/typera_picgo/raw/master/sias/202508201435626.png";
     let url2 = "https://gitee.com/jikeyang/typera_picgo/raw/master/sias/202508201438742.png";

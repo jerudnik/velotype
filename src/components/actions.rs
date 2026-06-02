@@ -60,6 +60,8 @@ actions!(
         QuitApplication,
         CheckForUpdates,
         ShowAbout,
+        InstallCliTool,
+        UninstallCliTool,
         DismissTransientUi,
         ToggleViewMode,
         ToggleWorkspace,

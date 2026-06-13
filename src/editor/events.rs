@@ -5,15 +5,19 @@
 //! tree mutations are delegated to [`DocumentTree`](super::tree::DocumentTree)
 //! so visible-order metadata stays in sync with every edit.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context as _, anyhow};
 use gpui::*;
 
 use super::Editor;
 use crate::components::{
     BlockEvent, BlockKind, BlockRecord, CollapsedCaretAffinity, IndentBlock, InlineTextTree,
-    OutdentBlock, TableCellPosition,
+    OutdentBlock, PastedImageSource, TableCellPosition,
 };
+use crate::config::{ImagePasteBehavior, read_app_preferences};
 
 impl Editor {
     fn focused_block_for_tab_key(
@@ -182,6 +186,7 @@ impl Editor {
                 | BlockEvent::RequestCalloutBreak
                 | BlockEvent::RequestMergeIntoPrev { .. }
                 | BlockEvent::RequestPasteMultiline { .. }
+                | BlockEvent::RequestPasteImage { .. }
                 | BlockEvent::RequestIndent
                 | BlockEvent::RequestOutdent
                 | BlockEvent::RequestDowngradeNestedListItemToChildParagraph
@@ -224,6 +229,355 @@ impl Editor {
             cx.notify();
         });
         self.focus_block(block.entity_id());
+    }
+
+    fn current_image_paste_behavior() -> ImagePasteBehavior {
+        read_app_preferences()
+            .map(|preferences| preferences.image_paste_behavior)
+            .unwrap_or(ImagePasteBehavior::None)
+    }
+
+    fn image_paste_root_dir(&self) -> anyhow::Result<PathBuf> {
+        if let Some(parent) = self.file_path.as_ref().and_then(|path| path.parent()) {
+            return Ok(parent.to_path_buf());
+        }
+        std::env::current_dir().context("failed to resolve current working directory")
+    }
+
+    fn clipboard_image_extension(format: ImageFormat) -> &'static str {
+        match format {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Webp => "webp",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Svg => "svg",
+            ImageFormat::Bmp => "bmp",
+            ImageFormat::Tiff => "tiff",
+        }
+    }
+
+    fn image_target_dir(
+        &self,
+        behavior: ImagePasteBehavior,
+        root_dir: &Path,
+        source: &PastedImageSource,
+    ) -> anyhow::Result<PathBuf> {
+        match behavior {
+            ImagePasteBehavior::None | ImagePasteBehavior::CopyToDocumentFolder => {
+                Ok(root_dir.to_path_buf())
+            }
+            ImagePasteBehavior::CopyToAssetsFolder => Ok(root_dir.join("assets")),
+            ImagePasteBehavior::CopyToNamedAssetsFolder => {
+                let base = self
+                    .file_path
+                    .as_ref()
+                    .and_then(|path| path.file_stem())
+                    .and_then(|stem| stem.to_str())
+                    .filter(|stem| !stem.trim().is_empty())
+                    .unwrap_or("untitle");
+                if self.file_path.is_some() {
+                    return Ok(root_dir.join(format!("{base}.assets")));
+                }
+
+                for index in 0.. {
+                    let folder = if index == 0 {
+                        "untitle.assets".to_string()
+                    } else {
+                        format!("untitle{index}.assets")
+                    };
+                    let path = root_dir.join(folder);
+                    if !path.exists() {
+                        return Ok(path);
+                    }
+                    if matches!(source, PastedImageSource::LocalPath(_)) {
+                        continue;
+                    }
+                }
+                unreachable!("unbounded search should always return");
+            }
+        }
+    }
+
+    fn unique_file_path(dir: &Path, preferred_name: &str) -> PathBuf {
+        let preferred = Path::new(preferred_name);
+        let stem = preferred
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("image");
+        let extension = preferred.extension().and_then(|ext| ext.to_str());
+        for index in 0.. {
+            let file_name = if index == 0 {
+                preferred_name.to_string()
+            } else if let Some(extension) = extension {
+                format!("{stem}{index}.{extension}")
+            } else {
+                format!("{stem}{index}")
+            };
+            let candidate = dir.join(file_name);
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+        unreachable!("unbounded search should always return");
+    }
+
+    fn path_parent_eq(left: &Path, right: &Path) -> bool {
+        let Some(parent) = left.parent() else {
+            return false;
+        };
+        let left = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+        left == right
+    }
+
+    fn materialize_pasted_image(
+        &self,
+        source: &PastedImageSource,
+    ) -> anyhow::Result<(PathBuf, bool)> {
+        let behavior = Self::current_image_paste_behavior();
+        let root_dir = self.image_paste_root_dir()?;
+
+        if matches!(behavior, ImagePasteBehavior::None)
+            && let PastedImageSource::LocalPath(path) = source
+        {
+            return Ok((path.clone(), false));
+        }
+
+        let target_dir = self.image_target_dir(behavior, &root_dir, source)?;
+        fs::create_dir_all(&target_dir)
+            .with_context(|| format!("failed to create '{}'", target_dir.display()))?;
+
+        match source {
+            PastedImageSource::LocalPath(path) => {
+                if Self::path_parent_eq(path, &target_dir) {
+                    return Ok((path.clone(), behavior != ImagePasteBehavior::None));
+                }
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image");
+                let target = Self::unique_file_path(&target_dir, file_name);
+                fs::copy(path, &target).with_context(|| {
+                    format!(
+                        "failed to copy '{}' to '{}'",
+                        path.display(),
+                        target.display()
+                    )
+                })?;
+                Ok((target, behavior != ImagePasteBehavior::None))
+            }
+            PastedImageSource::ClipboardImage(image) => {
+                let file_name = format!(
+                    "pasted-image.{}",
+                    Self::clipboard_image_extension(image.format)
+                );
+                let target = Self::unique_file_path(&target_dir, &file_name);
+                fs::write(&target, &image.bytes)
+                    .with_context(|| format!("failed to write '{}'", target.display()))?;
+                Ok((target, behavior != ImagePasteBehavior::None))
+            }
+        }
+    }
+
+    fn markdown_path_string(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    fn markdown_image_target(path: &str) -> String {
+        path.chars()
+            .flat_map(|ch| match ch {
+                '\\' | '(' | ')' | '"' => ['\\', ch].into_iter().collect::<Vec<_>>(),
+                _ => [ch].into_iter().collect::<Vec<_>>(),
+            })
+            .collect()
+    }
+
+    fn markdown_image_alt(path: &Path) -> String {
+        let alt = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("image");
+        alt.chars()
+            .flat_map(|ch| match ch {
+                '\\' | ']' => ['\\', ch].into_iter().collect::<Vec<_>>(),
+                _ => [ch].into_iter().collect::<Vec<_>>(),
+            })
+            .collect()
+    }
+
+    fn relative_markdown_path(root_dir: &Path, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(root_dir).ok()?;
+        Some(format!("./{}", Self::markdown_path_string(relative)))
+    }
+
+    fn pasted_image_markdown(&self, source: &PastedImageSource) -> anyhow::Result<String> {
+        let root_dir = self.image_paste_root_dir()?;
+        let (path, relative) = self.materialize_pasted_image(source)?;
+        let path_text = if relative {
+            Self::relative_markdown_path(&root_dir, &path)
+                .ok_or_else(|| anyhow!("failed to create a relative image path"))?
+        } else {
+            Self::markdown_path_string(&path)
+        };
+        Ok(format!(
+            "![{}]({})",
+            Self::markdown_image_alt(&path),
+            Self::markdown_image_target(&path_text)
+        ))
+    }
+
+    fn show_image_paste_error(&self, err: anyhow::Error, cx: &mut Context<Self>) {
+        let strings = cx.global::<crate::i18n::I18nManager>().strings().clone();
+        if let Some(window) = cx.active_window() {
+            let ok = strings.info_dialog_ok.clone();
+            let title = strings.image_paste_failed_title.clone();
+            let detail = err.to_string();
+            let _ = window.update(cx, |_view, window, cx| {
+                let buttons = [ok.as_str()];
+                let _ = window.prompt(PromptLevel::Critical, &title, Some(&detail), &buttons, cx);
+            });
+        } else {
+            eprintln!("{}: {err}", strings.image_paste_failed_title);
+        }
+    }
+
+    fn inserted_image_tree_for_block(block: &super::Block, markdown: &str) -> InlineTextTree {
+        if block.uses_raw_text_editing() || block.kind().is_code_block() {
+            InlineTextTree::plain(markdown.to_string())
+        } else {
+            InlineTextTree::from_markdown(markdown)
+        }
+    }
+
+    fn replace_current_block_selection_with_image_text(
+        &mut self,
+        block: &Entity<super::Block>,
+        leading: &InlineTextTree,
+        markdown: &str,
+        trailing: &InlineTextTree,
+        cx: &mut Context<Self>,
+    ) {
+        let (kind, title, cursor) = block.read_with(cx, |block, _cx| {
+            let mut title = leading.clone();
+            title.append_tree(Self::inserted_image_tree_for_block(block, markdown));
+            let cursor = title.visible_len();
+            title.append_tree(trailing.clone());
+            (block.kind(), title, cursor)
+        });
+        Self::set_block_title_and_kind(block, kind, title, cursor, cx);
+        if let Some(binding) = self.table_cell_binding(block.entity_id()) {
+            self.sync_table_record_from_runtime(&binding.table_block, cx);
+        }
+        self.focus_block(block.entity_id());
+        self.rebuild_image_runtimes(cx);
+    }
+
+    fn insert_image_block_after_paragraph(
+        &mut self,
+        block: &Entity<super::Block>,
+        leading: &InlineTextTree,
+        markdown: &str,
+        trailing: &InlineTextTree,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(location) = self.document.find_block_location(block.entity_id()) else {
+            return;
+        };
+        let leading_empty = leading.visible_len() == 0;
+        let trailing_empty = trailing.visible_len() == 0;
+
+        if leading_empty {
+            Self::set_block_title_and_kind(
+                block,
+                BlockKind::Paragraph,
+                InlineTextTree::plain(markdown.to_string()),
+                markdown.len(),
+                cx,
+            );
+            let image_block = block.clone();
+            if !trailing_empty {
+                let trailing_block =
+                    Self::new_block(cx, BlockRecord::new(BlockKind::Paragraph, trailing.clone()));
+                self.document.insert_blocks_at(
+                    location.parent,
+                    location.index + 1,
+                    vec![trailing_block],
+                    cx,
+                );
+            }
+            self.focus_block(image_block.entity_id());
+            self.rebuild_image_runtimes(cx);
+            return;
+        }
+
+        Self::set_block_title_and_kind(
+            block,
+            BlockKind::Paragraph,
+            leading.clone(),
+            leading.visible_len(),
+            cx,
+        );
+        let image_block = Self::new_block(cx, BlockRecord::paragraph(markdown.to_string()));
+        let mut inserted = vec![image_block.clone()];
+        if !trailing_empty {
+            inserted.push(Self::new_block(
+                cx,
+                BlockRecord::new(BlockKind::Paragraph, trailing.clone()),
+            ));
+        }
+        self.document
+            .insert_blocks_at(location.parent, location.index + 1, inserted, cx);
+        self.focus_block(image_block.entity_id());
+        self.rebuild_image_runtimes(cx);
+    }
+
+    fn handle_paste_image_request(
+        &mut self,
+        block: Entity<super::Block>,
+        leading: &InlineTextTree,
+        source: &PastedImageSource,
+        trailing: &InlineTextTree,
+        cx: &mut Context<Self>,
+    ) {
+        let markdown = match self.pasted_image_markdown(source) {
+            Ok(markdown) => markdown,
+            Err(err) => {
+                self.show_image_paste_error(err, cx);
+                return;
+            }
+        };
+
+        if self.replace_cross_block_selection_with_text(
+            &markdown,
+            None,
+            false,
+            crate::components::UndoCaptureKind::NonCoalescible,
+            cx,
+        ) {
+            return;
+        }
+
+        self.prepare_undo_capture(crate::components::UndoCaptureKind::NonCoalescible, cx);
+        let can_insert_image_block = self.view_mode == super::ViewMode::Rendered
+            && block.read(cx).kind() == BlockKind::Paragraph
+            && self.table_cell_binding(block.entity_id()).is_none()
+            && !block.read(cx).uses_raw_text_editing();
+
+        if can_insert_image_block {
+            self.insert_image_block_after_paragraph(&block, leading, &markdown, trailing, cx);
+        } else {
+            self.replace_current_block_selection_with_image_text(
+                &block, leading, &markdown, trailing, cx,
+            );
+        }
+
+        self.mark_dirty(cx);
+        self.finalize_pending_undo_capture(cx);
+        cx.notify();
     }
 
     fn jump_to_footnote_definition(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
@@ -996,6 +1350,16 @@ impl Editor {
             return;
         }
 
+        if let BlockEvent::RequestPasteImage {
+            leading,
+            source,
+            trailing,
+        } = event
+        {
+            self.handle_paste_image_request(block, leading, source, trailing, cx);
+            return;
+        }
+
         if let Some(binding) = self.table_cell_binding(block.entity_id()) {
             self.on_table_cell_event(binding, event, cx);
             return;
@@ -1321,7 +1685,8 @@ impl Editor {
                 self.finalize_pending_undo_capture(cx);
                 cx.notify();
             }
-            BlockEvent::RequestReplaceCrossBlockSelection { .. } => {}
+            BlockEvent::RequestPasteImage { .. }
+            | BlockEvent::RequestReplaceCrossBlockSelection { .. } => {}
             BlockEvent::RequestIndent => {
                 if current_visible_index == 0 {
                     return;
@@ -1776,6 +2141,60 @@ mod tests {
             );
             assert_eq!(editor.pending_focus, Some(paragraph.entity_id()));
             assert_eq!(paragraph.read(cx).selected_range, expected_backref_range);
+        });
+    }
+
+    #[gpui::test]
+    async fn image_block_insert_preserves_surrounding_paragraph_text(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| Editor::from_markdown(cx, "beforeafter".to_string(), None));
+
+        editor.update(cx, |editor, cx| {
+            let paragraph = editor.document.first_root().expect("paragraph").clone();
+            editor.insert_image_block_after_paragraph(
+                &paragraph,
+                &InlineTextTree::plain("before"),
+                "![image](./assets/image.png)",
+                &InlineTextTree::plain("after"),
+                cx,
+            );
+
+            let visible = editor.document.visible_blocks();
+            assert_eq!(visible.len(), 3);
+            assert_eq!(visible[0].entity.read(cx).display_text(), "before");
+            assert_eq!(
+                visible[1].entity.read(cx).display_text(),
+                "![image](./assets/image.png)"
+            );
+            assert!(visible[1].entity.read(cx).image_runtime().is_some());
+            assert_eq!(visible[2].entity.read(cx).display_text(), "after");
+        });
+    }
+
+    #[gpui::test]
+    async fn image_paste_text_in_code_block_stays_inside_block(cx: &mut TestAppContext) {
+        let editor =
+            cx.new(|cx| Editor::from_markdown(cx, "```\nbeforeafter\n```".to_string(), None));
+
+        editor.update(cx, |editor, cx| {
+            let block = editor.document.first_root().expect("code block").clone();
+            editor.replace_current_block_selection_with_image_text(
+                &block,
+                &InlineTextTree::plain("before"),
+                "![image](./assets/image.png)",
+                &InlineTextTree::plain("after"),
+                cx,
+            );
+
+            let visible = editor.document.visible_blocks();
+            assert_eq!(visible.len(), 1);
+            assert_eq!(
+                visible[0].entity.read(cx).kind(),
+                BlockKind::CodeBlock { language: None }
+            );
+            assert_eq!(
+                visible[0].entity.read(cx).display_text(),
+                "before![image](./assets/image.png)after"
+            );
         });
     }
 

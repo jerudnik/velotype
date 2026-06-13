@@ -5,8 +5,9 @@
 //! that the runtime tree can reconstruct is parsed into structured blocks.
 
 use std::ops::Range;
+use std::path::PathBuf;
 
-use gpui::{Pixels, Point, SharedString};
+use gpui::{Image, Pixels, Point, SharedString};
 use uuid::Uuid;
 
 use crate::components::markdown::html::{HtmlDocument, parse_html_document};
@@ -676,6 +677,16 @@ fn prefixed_multiline(content: &str, first_prefix: &str, continuation_prefix: &s
     rendered
 }
 
+/// Image payload extracted from GPUI's clipboard abstraction.
+///
+/// File-manager copies are usually represented as local paths, while bitmap
+/// copies from image editors or browsers arrive as encoded image bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PastedImageSource {
+    ClipboardImage(Image),
+    LocalPath(PathBuf),
+}
+
 /// Events emitted by a block to its parent editor when structural
 /// changes or focus transfers are needed that the block cannot handle alone.
 ///
@@ -716,6 +727,13 @@ pub enum BlockEvent {
         lines: Vec<String>,
         trailing: InlineTextTree,
         split_physical_lines: bool,
+    },
+    /// An image-like clipboard payload was pasted. The editor resolves
+    /// storage preferences and inserts either an image block or image text.
+    RequestPasteImage {
+        leading: InlineTextTree,
+        source: PastedImageSource,
+        trailing: InlineTextTree,
     },
     /// Replace the current editor-level cross-block selection with text
     /// submitted through the focused block input handler.

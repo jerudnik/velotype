@@ -171,7 +171,11 @@ pub(crate) struct ShortcutDefinition {
 }
 
 const BLOCK_CONTEXT: Option<&str> = Some("BlockEditor");
-const LEGACY_SELECT_ALL_ID: &str = "select_all";
+const SELECT_ALL_ID: &str = "select_all";
+const LEGACY_SELECT_ALL_IDS: &[&str] = &[
+    "select_all_source_text",
+    "select_focused_block_text_rendered",
+];
 
 // On macOS cmd-q is the system quit shortcut; Windows/Linux use Alt+F4 (OS-handled).
 #[cfg(target_os = "macos")]
@@ -366,7 +370,7 @@ const SHORTCUT_DEFINITIONS: &[ShortcutDefinition] = &[
     },
     ShortcutDefinition {
         command: ShortcutCommand::SelectAll,
-        id: LEGACY_SELECT_ALL_ID,
+        id: SELECT_ALL_ID,
         category: ShortcutCategory::Edit,
         default_keys: &["cmd-a", "ctrl-a"],
         context: BLOCK_CONTEXT,
@@ -541,6 +545,35 @@ fn default_keys(definition: ShortcutDefinition) -> Vec<String> {
         .collect()
 }
 
+/// Legacy preference keys that should feed a modern shortcut definition.
+///
+/// Select-all used to be represented by separate source/rendered commands. The
+/// editor now cycles those behaviors through one action, so old preferences map
+/// forward to `select_all` instead of being silently discarded on load.
+fn legacy_shortcut_ids(definition: ShortcutDefinition) -> &'static [&'static str] {
+    match definition.command {
+        ShortcutCommand::SelectAll => LEGACY_SELECT_ALL_IDS,
+        _ => &[],
+    }
+}
+
+/// Reads a user shortcut override, preferring the current id before aliases.
+fn configured_shortcut_keys(
+    definition: ShortcutDefinition,
+    config: &BTreeMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    config
+        .get(definition.id)
+        .and_then(|keys| normalize_shortcut_keys(keys))
+        .or_else(|| {
+            legacy_shortcut_ids(definition).iter().find_map(|id| {
+                config
+                    .get(*id)
+                    .and_then(|keys| normalize_shortcut_keys(keys))
+            })
+        })
+}
+
 fn shortcuts_conflict(
     left: ShortcutDefinition,
     left_keys: &[String],
@@ -555,9 +588,7 @@ pub(crate) fn normalize_shortcut_config(
 ) -> BTreeMap<String, Vec<String>> {
     let mut effective: BTreeMap<&'static str, (bool, Vec<String>)> = BTreeMap::new();
     for definition in SHORTCUT_DEFINITIONS {
-        let custom = config
-            .get(definition.id)
-            .and_then(|keys| normalize_shortcut_keys(keys));
+        let custom = configured_shortcut_keys(*definition, config);
         effective.insert(
             definition.id,
             match custom {

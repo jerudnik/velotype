@@ -2535,7 +2535,7 @@ impl Render for Block {
                                                 });
                                             },
                                         )
-                                        .occlude(),
+                                        .block_mouse_except_scroll(),
                                 )
                         }),
                     )
@@ -2606,7 +2606,7 @@ impl Render for Block {
                                     });
                                 });
                             })
-                            .occlude(),
+                            .block_mouse_except_scroll(),
                     )
                     .children(header_cells.into_iter().enumerate().map(|(column, cell)| {
                         let hover_block = weak_table_block.clone();
@@ -2662,7 +2662,7 @@ impl Render for Block {
                                             });
                                         });
                                     })
-                                    .occlude(),
+                                    .block_mouse_except_scroll(),
                             )
                             .child(cell)
                     }));
@@ -2746,7 +2746,7 @@ impl Render for Block {
                                                 });
                                             },
                                         )
-                                        .occlude(),
+                                        .block_mouse_except_scroll(),
                                 )
                                 .children(row.into_iter().enumerate().map(|(column, cell)| {
                                     div()
@@ -2822,7 +2822,7 @@ impl Render for Block {
                                     .cursor_pointer()
                                     .text_size(px(t.text_size))
                                     .text_color(c.table_append_button_text)
-                                    .occlude()
+                                    .block_mouse_except_scroll()
                                     .on_hover(
                                         cx.listener(Self::on_table_append_column_button_hover),
                                     )
@@ -2867,7 +2867,7 @@ impl Render for Block {
                                     .cursor_pointer()
                                     .text_size(px(t.text_size))
                                     .text_color(c.table_append_button_text)
-                                    .occlude()
+                                    .block_mouse_except_scroll()
                                     .on_hover(cx.listener(Self::on_table_append_row_button_hover))
                                     .on_click(cx.listener(Self::on_append_table_row))
                                     .child("+"),

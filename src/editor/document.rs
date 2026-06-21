@@ -13,9 +13,9 @@ use crate::components::{
 };
 use crate::components::{HtmlSafetyClass, parse_html_document};
 use crate::components::{
-    collect_root_table_candidate_region, collect_table_candidate_region,
-    is_root_table_candidate_line, is_table_candidate_line, parse_root_table_region,
-    parse_standalone_image, parse_table_region,
+    collect_pipeless_table_region, collect_root_table_candidate_region,
+    collect_table_candidate_region, is_root_table_candidate_line, is_table_candidate_line,
+    parse_root_table_region, parse_standalone_image, parse_table_region,
 };
 use crate::components::{is_mermaid_info_string, parse_display_math_source};
 
@@ -1107,6 +1107,14 @@ impl Editor {
                             .map(|line| plain_text_paragraph_block(cx, line)),
                     );
                 }
+                index = end;
+                continue;
+            }
+
+            if let Some(end) = collect_pipeless_table_region(lines, index)
+                && let Some(table) = parse_root_table_region(&lines[index..end])
+            {
+                roots.push(Self::new_block(cx, BlockRecord::table(table)));
                 index = end;
                 continue;
             }

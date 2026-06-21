@@ -198,6 +198,24 @@ impl BlockKind {
         matches!(self, Self::Quote | Self::Callout(_))
     }
 
+    /// Blocks that render as self-contained widgets with no caret position
+    /// after them. At the end of a rendered document they need a trailing
+    /// paragraph so a rendered-first user can keep typing past the structure
+    /// instead of having to drop to source mode.
+    pub fn is_atomic_structural(&self) -> bool {
+        matches!(
+            self,
+            Self::Separator
+                | Self::Table
+                | Self::CodeBlock { .. }
+                | Self::MathBlock
+                | Self::MermaidBlock
+                | Self::HtmlBlock
+                | Self::Comment
+                | Self::RawMarkdown
+        )
+    }
+
     pub fn is_callout(&self) -> bool {
         matches!(self, Self::Callout(_))
     }

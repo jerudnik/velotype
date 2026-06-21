@@ -704,7 +704,16 @@ impl Editor {
         let source = self.current_document_source(cx);
         let mappings = self.source_mapping_by_entity_id(cx);
         let visible = self.document.visible_blocks();
-        let mut chunks = Vec::new();
+
+        // Join blocks with the same spacing the document serializer uses
+        // (collect_root_markdown_lines): a blank line between blocks, but tight
+        // list items stay on consecutive lines. A flat single-newline join used
+        // to silently fuse separate paragraphs on paste, and once setext pairs
+        // are recognized it could even fabricate a heading from two paragraphs.
+        let mut result = String::new();
+        let mut wrote_chunk = false;
+        let mut pending_empty = 0usize;
+        let mut previous_was_list_item = false;
 
         for index in selection.start_index..=selection.end_index {
             let entity = visible.get(index)?.entity.clone();
@@ -731,7 +740,26 @@ impl Editor {
             if range.is_empty() && !include_atomic {
                 continue;
             }
-            chunks.push(self.markdown_chunk_for_block(
+
+            // Empty paragraphs are blank-line separators, not content: defer
+            // them so the gap between real blocks is reproduced as a blank line
+            // rather than collapsed. Atomic content (tables, separators, images)
+            // is len 0 too but is not an empty paragraph, so it still serializes.
+            if (full_block || include_atomic) && Editor::is_empty_root_paragraph(block) {
+                pending_empty += 1;
+                continue;
+            }
+
+            let current_is_list_item = block.kind().is_list_item();
+            if wrote_chunk {
+                let separator_lines = if previous_was_list_item && current_is_list_item {
+                    pending_empty
+                } else {
+                    pending_empty + 1
+                };
+                result.push_str(&"\n".repeat(separator_lines + 1));
+            }
+            result.push_str(&self.markdown_chunk_for_block(
                 &entity,
                 range,
                 full_block || include_atomic,
@@ -739,9 +767,12 @@ impl Editor {
                 &mappings,
                 cx,
             ));
+            wrote_chunk = true;
+            pending_empty = 0;
+            previous_was_list_item = current_is_list_item;
         }
 
-        Some(chunks.join("\n"))
+        Some(result)
     }
 
     fn markdown_chunk_for_block(
@@ -1013,7 +1044,7 @@ mod tests {
 
             assert_eq!(
                 editor.cross_block_selected_markdown(cx).as_deref(),
-                Some("alpha **bold**\n- item\n![alt](image.png)")
+                Some("alpha **bold**\n\n- item\n\n![alt](image.png)")
             );
             for visible in visible {
                 let block = visible.entity.read(cx);
@@ -1038,7 +1069,7 @@ mod tests {
             set_selection(editor, 0, 2, 2, 2, cx);
             assert_eq!(
                 editor.cross_block_selected_markdown(cx).as_deref(),
-                Some("pha\nbeta\nga")
+                Some("pha\n\nbeta\n\nga")
             );
         });
         redraw(cx);
@@ -1050,7 +1081,7 @@ mod tests {
             cx.read_from_clipboard()
                 .and_then(|item| item.text())
                 .as_deref(),
-            Some("pha\nbeta\nga")
+            Some("pha\n\nbeta\n\nga")
         );
         assert_eq!(
             editor.read_with(cx, |editor, cx| editor.document.markdown_text(cx)),
@@ -1067,7 +1098,7 @@ mod tests {
         editor.read_with(cx, |editor, cx| {
             assert_eq!(
                 editor.cross_block_selected_markdown(cx).as_deref(),
-                Some("pha\nbeta\nga")
+                Some("pha\n\nbeta\n\nga")
             );
         });
         cx.quit();

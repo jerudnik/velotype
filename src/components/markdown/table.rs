@@ -13,11 +13,15 @@ use crate::theme::Theme;
 /// Horizontal alignment declared by the table's delimiter row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableColumnAlignment {
-    /// Left-aligned cells.
+    /// No explicit alignment marker (`---`). Renders left, but stays distinct
+    /// from [`Left`](Self::Left) so an unmarked column is not silently rewritten
+    /// with a leading colon on the next serialize.
+    Default,
+    /// Explicit left alignment (`:---`).
     Left,
-    /// Center-aligned cells.
+    /// Center-aligned cells (`:---:`).
     Center,
-    /// Right-aligned cells.
+    /// Right-aligned cells (`---:`).
     Right,
 }
 
@@ -82,7 +86,7 @@ impl TableData {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let alignments = vec![TableColumnAlignment::Left; columns];
+        let alignments = vec![TableColumnAlignment::Default; columns];
         Self {
             header,
             rows,
@@ -104,7 +108,7 @@ impl TableData {
             self.header.push(InlineTextTree::plain(String::new()));
         }
         while self.alignments.len() < columns {
-            self.alignments.push(TableColumnAlignment::Left);
+            self.alignments.push(TableColumnAlignment::Default);
         }
         for row in &mut self.rows {
             while row.len() < columns {
@@ -178,9 +182,11 @@ impl TableData {
     /// Removes one body row while preserving at least one body row.
     pub fn remove_body_row(&mut self, row_index: usize) {
         self.normalize_shape();
-        if self.rows.len() <= 1 || row_index >= self.rows.len() {
+        if row_index >= self.rows.len() {
             return;
         }
+        // A table may be left header-only; the editor removes the whole block
+        // when the header itself is then deleted.
         self.rows.remove(row_index);
     }
 
@@ -508,7 +514,13 @@ fn strip_table_indent(line: &str) -> Option<&str> {
 
 fn split_table_cells(line: &str) -> Option<Vec<String>> {
     let rest = strip_table_indent(line)?.trim_end();
-    let inner = rest.strip_prefix('|')?.strip_suffix('|')?;
+    if rest.is_empty() {
+        return None;
+    }
+    // Outer pipes are optional (GFM): strip them when present so pipeless rows
+    // like `Name | Score` split the same way as `| Name | Score |`.
+    let inner = rest.strip_prefix('|').unwrap_or(rest);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
     let mut cells = Vec::new();
     let mut current = String::new();
     let mut escaping = false;
@@ -559,13 +571,15 @@ fn parse_alignment_cell(cell: &str) -> Option<TableColumnAlignment> {
     Some(match (left, right) {
         (true, true) => TableColumnAlignment::Center,
         (false, true) => TableColumnAlignment::Right,
-        _ => TableColumnAlignment::Left,
+        (true, false) => TableColumnAlignment::Left,
+        (false, false) => TableColumnAlignment::Default,
     })
 }
 
 fn serialize_alignment(alignment: TableColumnAlignment) -> &'static str {
     match alignment {
-        TableColumnAlignment::Left => "---",
+        TableColumnAlignment::Default => "---",
+        TableColumnAlignment::Left => ":---",
         TableColumnAlignment::Center => ":---:",
         TableColumnAlignment::Right => "---:",
     }
@@ -592,6 +606,21 @@ pub fn is_table_candidate_line(line: &str) -> bool {
     strip_table_indent(line)
         .map(str::trim_end)
         .is_some_and(|rest| rest.starts_with('|'))
+}
+
+/// Number of pipe-separated cells in `line`, treating outer pipes as optional
+/// (GFM) so pipeless rows like `Name | Score` are recognized. Returns `None`
+/// for single-column lines so prose containing a stray `|` is not mistaken for
+/// a table row.
+pub fn table_row_column_count(line: &str) -> Option<usize> {
+    split_table_cells(line)
+        .map(|cells| cells.len())
+        .filter(|count| *count >= 2)
+}
+
+/// True when `line` could be a table row, including a pipeless GFM row.
+pub fn is_table_row_candidate(line: &str) -> bool {
+    table_row_column_count(line).is_some()
 }
 
 /// Collects a contiguous table-candidate region in the current container
@@ -623,10 +652,11 @@ pub fn parse_table_region(lines: &[String]) -> Option<TableData> {
 
     let mut rows = Vec::new();
     for line in &lines[2..] {
-        let cells = split_table_cells(line)?;
-        if cells.len() != header.len() {
-            return None;
-        }
+        // GFM normalizes body rows to the header width: short rows are padded
+        // with empty cells and long rows drop their trailing cells, instead of
+        // invalidating the whole table.
+        let mut cells = split_table_cells(line)?;
+        cells.resize(header.len(), String::new());
         rows.push(
             cells
                 .into_iter()
@@ -645,6 +675,39 @@ pub fn parse_table_region(lines: &[String]) -> Option<TableData> {
     })
 }
 
+/// Returns true when `line` is a delimiter row of exactly `columns` cells, each
+/// a valid alignment specifier.
+fn is_delimiter_row(line: &str, columns: usize) -> bool {
+    split_table_cells(line).is_some_and(|cells| {
+        cells.len() == columns
+            && cells
+                .iter()
+                .all(|cell| parse_alignment_cell(cell).is_some())
+    })
+}
+
+/// Detects a table that starts at `start` without requiring outer pipes,
+/// returning the region end (exclusive) when `lines[start]` is a multi-column
+/// header followed by a matching delimiter row. Body rows extend to the next
+/// blank line, matching GFM. Returns `None` for ordinary prose so a stray `|`
+/// is never mistaken for a table; single-column pipeless candidates are also
+/// rejected because they are ambiguous with setext headings.
+pub fn collect_pipeless_table_region(lines: &[String], start: usize) -> Option<usize> {
+    let header = split_table_cells(lines.get(start)?)?;
+    if header.len() < 2 {
+        return None;
+    }
+    if !is_delimiter_row(lines.get(start + 1)?, header.len()) {
+        return None;
+    }
+
+    let mut end = start + 2;
+    while end < lines.len() && !lines[end].trim().is_empty() {
+        end += 1;
+    }
+    Some(end)
+}
+
 /// Returns true when a root-level line is a candidate native table row.
 pub fn is_root_table_candidate_line(line: &str) -> bool {
     is_table_candidate_line(line)
@@ -658,6 +721,20 @@ pub fn collect_root_table_candidate_region(lines: &[String], start: usize) -> us
 /// Parses a root-level pipe table region into native table data.
 pub fn parse_root_table_region(lines: &[String]) -> Option<TableData> {
     parse_table_region(lines)
+}
+
+/// Parses a single table body row, normalized to `columns` cells (padded when
+/// short, truncated when long). Returns `None` when the line is not a table
+/// row at all.
+pub fn parse_table_body_row(line: &str, columns: usize) -> Option<Vec<InlineTextTree>> {
+    let mut cells = split_table_cells(line)?;
+    cells.resize(columns, String::new());
+    Some(
+        cells
+            .into_iter()
+            .map(|cell| InlineTextTree::from_markdown(&cell))
+            .collect(),
+    )
 }
 
 /// Serializes native table data to canonical pipe-table Markdown lines.
@@ -680,8 +757,9 @@ pub fn serialize_table_markdown_lines(table: &TableData) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TableColumnAlignment, TableColumnLayout, TableData, collect_root_table_candidate_region,
-        is_root_table_candidate_line, parse_root_table_region, serialize_table_markdown_lines,
+        TableColumnAlignment, TableColumnLayout, TableData, collect_pipeless_table_region,
+        collect_root_table_candidate_region, is_root_table_candidate_line, parse_root_table_region,
+        serialize_table_markdown_lines,
     };
     use crate::components::InlineTextTree;
 
@@ -720,6 +798,90 @@ mod tests {
     }
 
     #[test]
+    fn rejects_alignment_row_with_wrong_column_count() {
+        let lines = vec!["| A | B | C |".to_string(), "| --- | --- |".to_string()];
+        assert!(parse_root_table_region(&lines).is_none());
+    }
+
+    #[test]
+    fn preserves_explicit_left_alignment_colon() {
+        // ":---" is explicit left and must survive a parse/serialize round-trip
+        // instead of being silently rewritten to a bare "---".
+        let lines = vec![
+            "| L | D | R |".to_string(),
+            "| :--- | --- | ---: |".to_string(),
+            "| a | b | c |".to_string(),
+        ];
+        let table = parse_root_table_region(&lines).expect("table should parse");
+        assert_eq!(
+            table.alignments,
+            vec![
+                TableColumnAlignment::Left,
+                TableColumnAlignment::Default,
+                TableColumnAlignment::Right
+            ]
+        );
+        assert_eq!(
+            serialize_table_markdown_lines(&table)[1],
+            "| :--- | --- | ---: |"
+        );
+    }
+
+    #[test]
+    fn pads_short_body_rows_and_truncates_long_ones() {
+        let lines = vec![
+            "| A | B | C |".to_string(),
+            "| --- | --- | --- |".to_string(),
+            "| short |".to_string(),
+            "| 1 | 2 | 3 | 4 |".to_string(),
+        ];
+        let table = parse_root_table_region(&lines).expect("table should parse");
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0].len(), 3);
+        assert_eq!(table.rows[0][0].serialize_markdown(), "short");
+        assert!(table.rows[0][1].serialize_markdown().is_empty());
+        assert!(table.rows[0][2].serialize_markdown().is_empty());
+        assert_eq!(table.rows[1].len(), 3);
+        assert_eq!(table.rows[1][2].serialize_markdown(), "3");
+    }
+
+    #[test]
+    fn parses_pipeless_table() {
+        let lines = vec![
+            "Name | Score".to_string(),
+            "--- | ---".to_string(),
+            "Alice | 10".to_string(),
+            "Bob | 7".to_string(),
+        ];
+        let end = collect_pipeless_table_region(&lines, 0).expect("region");
+        assert_eq!(end, 4);
+        let table = parse_root_table_region(&lines[..end]).expect("table should parse");
+        assert_eq!(table.header.len(), 2);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.header[0].serialize_markdown(), "Name");
+        assert_eq!(table.rows[1][1].serialize_markdown(), "7");
+    }
+
+    #[test]
+    fn prose_with_pipe_is_not_a_pipeless_table() {
+        let lines = vec!["this | that".to_string(), "and the next line".to_string()];
+        assert!(collect_pipeless_table_region(&lines, 0).is_none());
+    }
+
+    #[test]
+    fn pipeless_table_requires_valid_delimiter_row() {
+        let lines = vec!["Name | Score".to_string(), "Alice | 10".to_string()];
+        assert!(collect_pipeless_table_region(&lines, 0).is_none());
+    }
+
+    #[test]
+    fn single_column_pipeless_is_not_a_table() {
+        // Ambiguous with a setext heading; must not be captured as a table.
+        let lines = vec!["Title".to_string(), "---".to_string()];
+        assert!(collect_pipeless_table_region(&lines, 0).is_none());
+    }
+
+    #[test]
     fn serializes_canonical_pipe_table() {
         let table = TableData {
             header: vec![
@@ -730,7 +892,7 @@ mod tests {
                 InlineTextTree::plain("A | B".to_string()),
                 InlineTextTree::plain("value".to_string()),
             ]],
-            alignments: vec![TableColumnAlignment::Left, TableColumnAlignment::Right],
+            alignments: vec![TableColumnAlignment::Default, TableColumnAlignment::Right],
         };
         assert_eq!(
             serialize_table_markdown_lines(&table),
@@ -849,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn append_column_falls_back_to_left_when_alignments_are_missing() {
+    fn append_column_pads_missing_alignments_with_default() {
         let mut table = TableData {
             header: vec![InlineTextTree::plain("A".to_string())],
             rows: vec![vec![InlineTextTree::plain("1".to_string())]],
@@ -860,7 +1022,7 @@ mod tests {
 
         assert_eq!(
             table.alignments,
-            vec![TableColumnAlignment::Left, TableColumnAlignment::Left]
+            vec![TableColumnAlignment::Default, TableColumnAlignment::Left]
         );
         assert_eq!(table.header.len(), 2);
         assert_eq!(table.rows[0].len(), 2);
@@ -873,9 +1035,9 @@ mod tests {
         assert_eq!(
             table.alignments,
             vec![
-                TableColumnAlignment::Left,
+                TableColumnAlignment::Default,
                 TableColumnAlignment::Center,
-                TableColumnAlignment::Left
+                TableColumnAlignment::Default
             ]
         );
     }
@@ -926,12 +1088,16 @@ mod tests {
     }
 
     #[test]
-    fn remove_body_row_preserves_at_least_one_row() {
+    fn remove_body_row_can_empty_the_table() {
         let mut table = TableData::new_empty(2, 2);
         table.remove_body_row(0);
         assert_eq!(table.rows.len(), 1);
         table.remove_body_row(0);
-        assert_eq!(table.rows.len(), 1);
+        // The last body row can be removed, leaving a header-only table.
+        assert!(table.rows.is_empty());
+        // Out-of-range removal is a no-op.
+        table.remove_body_row(0);
+        assert!(table.rows.is_empty());
     }
 
     #[test]

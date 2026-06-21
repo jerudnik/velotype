@@ -1777,6 +1777,15 @@ impl Block {
 
     pub(crate) fn convert_to_separator(&mut self, cx: &mut Context<Self>) {
         self.prepare_undo_capture(UndoCaptureKind::NonCoalescible, cx);
+        self.make_separator();
+        cx.emit(BlockEvent::Changed);
+        cx.notify();
+    }
+
+    /// Turns this block into a separator in place without emitting events or
+    /// capturing undo, so editor-level flows that already manage those can
+    /// reuse the conversion.
+    pub(crate) fn make_separator(&mut self) {
         self.clear_inline_projection();
         self.record.kind = BlockKind::Separator;
         self.record.raw_fallback = None;
@@ -1788,8 +1797,6 @@ impl Block {
         self.marked_range = None;
         self.cursor_blink_epoch = Instant::now();
         self.clear_vertical_motion();
-        cx.emit(BlockEvent::Changed);
-        cx.notify();
     }
 
     pub(crate) fn enter_code_block(

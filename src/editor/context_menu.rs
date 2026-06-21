@@ -5,9 +5,7 @@ use std::time::Duration;
 use gpui::*;
 
 use super::{Editor, TableAxisSelection, ViewMode};
-use crate::components::{
-    BlockRecord, DismissTransientUi, TableAxisKind, TableColumnAlignment, TableData,
-};
+use crate::components::{DismissTransientUi, TableAxisKind, TableColumnAlignment, TableData};
 use crate::i18n::I18nManager;
 use crate::theme::Theme;
 
@@ -398,21 +396,7 @@ impl Editor {
         // A table inserted as the last block in its container leaves no line
         // below it, so in rendered mode the caret cannot move past the table.
         // Add a trailing empty paragraph to land on when nothing follows it.
-        if let Some(location) = self.document.find_block_location(new_block.entity_id()) {
-            let sibling_count = match location.parent.as_ref() {
-                Some(parent) => parent.read(cx).children.len(),
-                None => self.document.root_count(),
-            };
-            if location.index + 1 >= sibling_count {
-                let trailing = Self::new_block(cx, BlockRecord::paragraph(String::new()));
-                self.document.insert_blocks_at(
-                    location.parent,
-                    location.index + 1,
-                    vec![trailing],
-                    cx,
-                );
-            }
-        }
+        self.ensure_trailing_paragraph_after_structural(&new_block, cx);
 
         self.rebuild_table_runtimes(cx);
         if let Some(first_cell) = new_block
@@ -459,7 +443,10 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.on_apply_column_alignment(TableColumnAlignment::Left, cx);
+        // Left is the default, so emit the unmarked `---` form rather than an
+        // explicit `:---`; an explicit colon is only kept when the source had
+        // one. This keeps the menu's output unchanged from before.
+        self.on_apply_column_alignment(TableColumnAlignment::Default, cx);
     }
 
     pub(super) fn on_align_table_column_center(
@@ -591,10 +578,22 @@ impl Editor {
         let Some(table_block) = self.table_block_by_id(selection.table_block_id, cx) else {
             return;
         };
+        let row_count = table_block
+            .read(cx)
+            .record
+            .table
+            .as_ref()
+            .map(|table| table.rows.len());
         self.close_context_menu(cx);
-        // Visual index 0 is the header: deleting it promotes the first body row.
+        // Visual index 0 is the header: deleting it promotes the first body row,
+        // unless there is no body row left, in which case it was the table's last
+        // row and the whole table is removed.
         if selection.index == 0 {
-            self.delete_table_header_row(&table_block, cx);
+            if row_count == Some(0) {
+                self.remove_table_block(&table_block, cx);
+            } else {
+                self.delete_table_header_row(&table_block, cx);
+            }
         } else {
             self.delete_table_row(&table_block, selection.index - 1, cx);
         }
@@ -629,8 +628,19 @@ impl Editor {
         let Some(table_block) = self.table_block_by_id(selection.table_block_id, cx) else {
             return;
         };
+        let column_count = table_block
+            .read(cx)
+            .record
+            .table
+            .as_ref()
+            .map(|table| table.column_count());
         self.close_context_menu(cx);
-        self.delete_table_column(&table_block, selection.index, cx);
+        // Removing the only column empties the table, so drop the whole block.
+        if column_count == Some(1) {
+            self.remove_table_block(&table_block, cx);
+        } else {
+            self.delete_table_column(&table_block, selection.index, cx);
+        }
     }
 
     fn render_axis_menu_item(
@@ -881,7 +891,9 @@ impl Editor {
                             theme,
                             "table-axis-delete-column",
                             s.table_axis_delete_column.clone(),
-                            table.column_count() > 1,
+                            // Always enabled: deleting the last column removes the
+                            // whole table.
+                            true,
                             true,
                             Self::on_delete_table_column,
                             cx,
@@ -950,19 +962,14 @@ impl Editor {
                                 .bg(c.dialog_border)
                                 .into_any_element(),
                         );
-                        // Deleting the header (index 0) promotes the first body
-                        // row, so it only needs one body row; deleting a body row
-                        // must leave at least one behind.
-                        let delete_enabled = if selection.index == 0 {
-                            !table.rows.is_empty()
-                        } else {
-                            table.rows.len() > 1
-                        };
+                        // Always enabled: deleting the header promotes the first
+                        // body row, and deleting the last remaining row removes
+                        // the whole table.
                         items.push(Self::render_axis_menu_item(
                             theme,
                             "table-axis-delete-row",
                             s.table_axis_delete_row.clone(),
-                            delete_enabled,
+                            true,
                             true,
                             Self::on_delete_table_row,
                             cx,

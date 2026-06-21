@@ -18,9 +18,9 @@ impl Block {
     pub(crate) fn text_align(&self) -> TextAlign {
         match self
             .table_cell_alignment()
-            .unwrap_or(TableColumnAlignment::Left)
+            .unwrap_or(TableColumnAlignment::Default)
         {
-            TableColumnAlignment::Left => TextAlign::Left,
+            TableColumnAlignment::Default | TableColumnAlignment::Left => TextAlign::Left,
             TableColumnAlignment::Center => TextAlign::Center,
             TableColumnAlignment::Right => TextAlign::Right,
         }

@@ -108,6 +108,17 @@ impl DocumentTree {
         self.snapshot.location_by_entity.get(&entity_id).cloned()
     }
 
+    /// Returns the sibling immediately before `entity_id` within the same
+    /// parent, if any.
+    pub(super) fn previous_sibling(&self, entity_id: EntityId, cx: &App) -> Option<Entity<Block>> {
+        let location = self.find_block_location(entity_id)?;
+        let prev_index = location.index.checked_sub(1)?;
+        match &location.parent {
+            Some(parent) => parent.read(cx).children.get(prev_index).cloned(),
+            None => self.roots.get(prev_index).cloned(),
+        }
+    }
+
     pub(super) fn last_visible_descendant(&self, entity_id: EntityId) -> Option<Entity<Block>> {
         let descendant_id = self
             .snapshot

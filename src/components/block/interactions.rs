@@ -311,6 +311,10 @@ impl Block {
             && self.selected_range.is_empty()
             && self.cursor_offset() == self.visible_len()
             && BlockKind::parse_separator_line(self.display_text())
+            // A dash run is also a setext underline; defer it to the editor so a
+            // preceding paragraph can become a heading (the editor falls back to
+            // a separator when there is no heading target).
+            && BlockKind::parse_setext_underline(self.display_text()).is_none()
         {
             self.convert_to_separator(cx);
             cx.emit(BlockEvent::RequestNewline {

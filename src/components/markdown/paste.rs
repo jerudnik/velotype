@@ -6,8 +6,16 @@
 //! the document block builder.
 
 use super::html::is_inline_tag;
+use super::table::collect_pipeless_table_region;
 
 pub(crate) fn should_split_plain_multiline_paste(lines: &[String]) -> bool {
+    // A pipeless GFM table reads cell-by-cell as plain lines, so detect the
+    // header-plus-delimiter shape explicitly and leave the whole paste to the
+    // block builder instead of splitting it into one paragraph per row.
+    if (0..lines.len()).any(|start| collect_pipeless_table_region(lines, start).is_some()) {
+        return false;
+    }
+
     lines.iter().filter(|line| !line.trim().is_empty()).count() >= 2
         && lines
             .iter()
@@ -35,7 +43,18 @@ fn is_plain_inline_paste_line(line: &str) -> bool {
         || is_simple_list_marker(trimmed)
         || is_simple_atx_heading(trimmed)
         || is_simple_separator(trimmed)
+        || is_setext_underline(trimmed)
         || is_simple_reference_definition(trimmed))
+}
+
+/// Matches a setext underline run (`=====` or `-----`). The `-` form is already
+/// covered by `is_simple_separator`, but `=` is not a thematic break, so without
+/// this a `text` + `=====` pair would be split into two plain paragraphs instead
+/// of routed to the structural importer as an H1.
+fn is_setext_underline(trimmed: &str) -> bool {
+    let core = trimmed.trim_end();
+    core.len() >= 3
+        && (core.bytes().all(|byte| byte == b'=') || core.bytes().all(|byte| byte == b'-'))
 }
 
 fn is_closed_inline_html_line(trimmed: &str) -> bool {
@@ -181,5 +200,37 @@ mod tests {
 
         let lines = vec!["# Title".to_string(), "body".to_string()];
         assert!(!should_split_plain_multiline_paste(&lines));
+    }
+
+    #[test]
+    fn rejects_setext_underline_pairs() {
+        // "=" underline must route to the structural importer (-> H1), like the
+        // "-" underline (-> H2) already did, rather than splitting into two
+        // plain paragraphs.
+        let lines = vec!["Title".to_string(), "=====".to_string()];
+        assert!(!should_split_plain_multiline_paste(&lines));
+
+        let lines = vec!["Title".to_string(), "-----".to_string()];
+        assert!(!should_split_plain_multiline_paste(&lines));
+    }
+
+    #[test]
+    fn rejects_pipeless_table() {
+        // A pipeless GFM table has no leading `|`, so its rows look like plain
+        // lines; the header-plus-delimiter shape must still route to the block
+        // builder instead of becoming one paragraph per row.
+        let lines = vec![
+            "Header 1 | Header 2 | Header 3".to_string(),
+            "-------- | -------- | --------".to_string(),
+            "Cell 1   | Cell 2   | Cell 3".to_string(),
+        ];
+        assert!(!should_split_plain_multiline_paste(&lines));
+
+        // Prose with a stray `|` and no delimiter row still splits normally.
+        let lines = vec![
+            "see foo | bar for details".to_string(),
+            "and another | line here".to_string(),
+        ];
+        assert!(should_split_plain_multiline_paste(&lines));
     }
 }

@@ -15,7 +15,8 @@ use gpui::*;
 use super::Editor;
 use crate::components::{
     BlockEvent, BlockKind, BlockRecord, CollapsedCaretAffinity, IndentBlock, InlineTextTree,
-    OutdentBlock, PastedImageSource, TableCellPosition,
+    OutdentBlock, PastedImageSource, TableCellPosition, is_table_row_candidate,
+    parse_root_table_region, parse_table_body_row,
 };
 use crate::config::{ImagePasteBehavior, read_app_preferences};
 
@@ -645,6 +646,251 @@ impl Editor {
             block.cursor_blink_epoch = Instant::now();
             cx.notify();
         });
+    }
+
+    /// A block that a setext underline below it can promote into a heading: a
+    /// non-empty, single-line, plain paragraph with no children.
+    fn is_setext_heading_target(block: &Entity<super::Block>, cx: &App) -> bool {
+        let block = block.read(cx);
+        if block.kind() != BlockKind::Paragraph || !block.children.is_empty() {
+            return false;
+        }
+        let text = block.record.title.visible_text();
+        !text.trim().is_empty() && !text.contains('\n')
+    }
+
+    /// Handles Enter pressed on a paragraph that is a pure setext underline.
+    /// When a matching paragraph precedes it at the root, the two collapse into
+    /// a heading; a lone dash run still falls back to a thematic break. Returns
+    /// true when it consumed the newline.
+    fn try_form_setext_heading_on_newline(
+        &mut self,
+        block: &Entity<super::Block>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let text = block.read(cx).display_text().to_string();
+        let Some(level) = BlockKind::parse_setext_underline(&text) else {
+            return false;
+        };
+        if block.read(cx).kind() != BlockKind::Paragraph {
+            return false;
+        }
+        let Some(location) = self.document.find_block_location(block.entity_id()) else {
+            return false;
+        };
+
+        // Only root paragraphs auto-form headings; nested contexts (quotes,
+        // lists) keep their existing newline behavior.
+        let target = if location.parent.is_none() {
+            self.document
+                .previous_sibling(block.entity_id(), cx)
+                .filter(|prev| Self::is_setext_heading_target(prev, cx))
+        } else {
+            None
+        };
+
+        // A `=` underline with no heading target is ordinary text: defer to the
+        // normal newline split. A dash run still has to become a separator.
+        if target.is_none() && !BlockKind::parse_separator_line(&text) {
+            return false;
+        }
+
+        // The newline's own capture was already finalized by the block's Changed
+        // event (nothing had changed yet), so start a fresh one here that spans
+        // the heading/separator conversion. prepare is a no-op if one is pending.
+        self.prepare_undo_capture(crate::components::UndoCaptureKind::NonCoalescible, cx);
+
+        if let Some(prev) = target {
+            let heading_title = prev.read(cx).record.title.clone();
+            let cursor = heading_title.visible_len();
+            let removed_id = block.entity_id();
+            let new_paragraph = Self::new_block(cx, BlockRecord::paragraph(String::new()));
+
+            Self::set_block_title_and_kind(
+                &prev,
+                BlockKind::Heading { level },
+                heading_title,
+                cursor,
+                cx,
+            );
+            self.document.with_structure_mutation(cx, |document, cx| {
+                let _ = document.remove_block_by_id_raw(removed_id, cx);
+            });
+            if let Some(heading_location) = self.document.find_block_location(prev.entity_id()) {
+                self.document.insert_blocks_at(
+                    heading_location.parent,
+                    heading_location.index + 1,
+                    vec![new_paragraph.clone()],
+                    cx,
+                );
+            }
+            self.focus_block(new_paragraph.entity_id());
+        } else {
+            block.update(cx, |block, _cx| block.make_separator());
+            let new_paragraph = Self::new_block(cx, BlockRecord::paragraph(String::new()));
+            self.document.insert_blocks_at(
+                location.parent,
+                location.index + 1,
+                vec![new_paragraph.clone()],
+                cx,
+            );
+            self.focus_block(new_paragraph.entity_id());
+        }
+
+        self.rebuild_image_runtimes(cx);
+        self.mark_dirty(cx);
+        self.finalize_pending_undo_capture(cx);
+        cx.notify();
+        true
+    }
+
+    /// Handles Enter pressed on a paragraph that is a pipe-table row. A
+    /// delimiter row under a header paragraph forms a native table; a body row
+    /// directly under an existing table is absorbed into it. After either, the
+    /// caret lands in a fresh paragraph below the table so consecutive rows can
+    /// be typed. Returns true when it consumed the newline.
+    fn try_form_or_extend_table_on_newline(
+        &mut self,
+        block: &Entity<super::Block>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let text = block.read(cx).display_text().to_string();
+        if block.read(cx).kind() != BlockKind::Paragraph || !is_table_row_candidate(&text) {
+            return false;
+        }
+        let Some(location) = self.document.find_block_location(block.entity_id()) else {
+            return false;
+        };
+        if location.parent.is_some() {
+            return false;
+        }
+        let Some(prev) = self.document.previous_sibling(block.entity_id(), cx) else {
+            return false;
+        };
+
+        if prev.read(cx).kind() == BlockKind::Table {
+            // A multi-column row typed directly under a table is meant as a row,
+            // so absorb it and let the table normalize ragged cell counts the
+            // same way pasted rows are padded or truncated to the header width.
+            return self.extend_table_with_typed_row(&prev, block, &text, cx);
+        }
+
+        if prev.read(cx).kind() != BlockKind::Paragraph {
+            return false;
+        }
+        let header_text = prev.read(cx).display_text().to_string();
+        if !is_table_row_candidate(&header_text) {
+            return false;
+        }
+        let Some(table) = parse_root_table_region(&[header_text, text]) else {
+            return false;
+        };
+
+        self.prepare_undo_capture(crate::components::UndoCaptureKind::NonCoalescible, cx);
+        // Remove the lower (delimiter) block first so the header index is stable.
+        let header_index = location.index - 1;
+        let removed_delimiter = block.entity_id();
+        let removed_header = prev.entity_id();
+        let table_block = Self::new_table_block(cx, table);
+        let new_paragraph = Self::new_block(cx, BlockRecord::paragraph(String::new()));
+        self.document.with_structure_mutation(cx, |document, cx| {
+            let _ = document.remove_block_by_id_raw(removed_delimiter, cx);
+            let _ = document.remove_block_by_id_raw(removed_header, cx);
+        });
+        self.document.insert_blocks_at(
+            None,
+            header_index,
+            vec![table_block.clone(), new_paragraph.clone()],
+            cx,
+        );
+        self.rebuild_table_runtimes(cx);
+        self.focus_block(new_paragraph.entity_id());
+        self.mark_dirty(cx);
+        self.finalize_pending_undo_capture(cx);
+        cx.notify();
+        true
+    }
+
+    fn extend_table_with_typed_row(
+        &mut self,
+        table_block: &Entity<super::Block>,
+        row_block: &Entity<super::Block>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Capture any in-progress cell edits before mutating the record.
+        self.sync_table_record_from_runtime(table_block, cx);
+        let Some(mut table) = table_block.read(cx).record.table.clone() else {
+            return false;
+        };
+        let Some(row) = parse_table_body_row(text, table.column_count()) else {
+            return false;
+        };
+
+        self.prepare_undo_capture(crate::components::UndoCaptureKind::NonCoalescible, cx);
+        table.rows.push(row);
+        table_block.update(cx, |block, cx| {
+            block.record.table = Some(table);
+            cx.notify();
+        });
+
+        let removed_id = row_block.entity_id();
+        self.document.with_structure_mutation(cx, |document, cx| {
+            let _ = document.remove_block_by_id_raw(removed_id, cx);
+        });
+        let new_paragraph = Self::new_block(cx, BlockRecord::paragraph(String::new()));
+        if let Some(table_location) = self.document.find_block_location(table_block.entity_id()) {
+            self.document.insert_blocks_at(
+                table_location.parent,
+                table_location.index + 1,
+                vec![new_paragraph.clone()],
+                cx,
+            );
+        }
+        self.rebuild_table_runtimes(cx);
+        self.focus_block(new_paragraph.entity_id());
+        self.mark_dirty(cx);
+        self.finalize_pending_undo_capture(cx);
+        cx.notify();
+        true
+    }
+
+    /// Inserts an empty paragraph after `block` when it renders as a
+    /// self-contained structure the caret cannot move past (table, code, math,
+    /// separator, quote, callout, footnote definition, standalone image, ...)
+    /// and nothing currently follows it in its container. This keeps a rendered
+    /// document from ending on such a block, so a rendered-first user can keep
+    /// typing past it rather than being stranded. No-op when something already
+    /// follows the block or it is not a stranding structure.
+    pub(super) fn ensure_trailing_paragraph_after_structural(
+        &mut self,
+        block: &Entity<super::Block>,
+        cx: &mut Context<Self>,
+    ) {
+        let strands = {
+            let block = block.read(cx);
+            let kind = block.kind();
+            kind.is_atomic_structural()
+                || kind.is_quote_container()
+                || kind.is_footnote_definition()
+                || block.renders_as_standalone_image()
+        };
+        if !strands {
+            return;
+        }
+        let Some(location) = self.document.find_block_location(block.entity_id()) else {
+            return;
+        };
+        let sibling_count = match location.parent.as_ref() {
+            Some(parent) => parent.read(cx).children.len(),
+            None => self.document.root_count(),
+        };
+        if location.index + 1 < sibling_count {
+            return;
+        }
+        let trailing = Self::new_block(cx, BlockRecord::paragraph(String::new()));
+        self.document
+            .insert_blocks_at(location.parent, location.index + 1, vec![trailing], cx);
     }
 
     fn apply_paragraph_shortcuts(
@@ -1410,6 +1656,17 @@ impl Editor {
                 trailing,
                 source_already_mutated,
             } => {
+                // Typing a setext underline (`=====`/`-----`) under a paragraph
+                // and pressing Enter turns that paragraph into a heading, the
+                // same way the importer treats the two adjacent lines.
+                if self.try_form_setext_heading_on_newline(&block, cx) {
+                    return;
+                }
+                // Typing a delimiter row under a header forms a native table,
+                // and typing further pipe rows below the table absorbs them.
+                if self.try_form_or_extend_table_on_newline(&block, cx) {
+                    return;
+                }
                 let Some(location) = self.document.find_block_location(block.entity_id()) else {
                     return;
                 };
@@ -1629,6 +1886,18 @@ impl Editor {
                 );
                 self.rebuild_table_runtimes(cx);
 
+                // A structural block pasted at the very end of the document leaves
+                // no line below it; remember that so a trailing paragraph can be
+                // added once the paste (and any quote normalization) settles.
+                let inserted_at_doc_end = inserted_roots.last().is_some_and(|last| {
+                    self.document
+                        .find_block_location(last.entity_id())
+                        .is_some_and(|location| {
+                            location.parent.is_none()
+                                && location.index + 1 >= self.document.root_count()
+                        })
+                });
+
                 if let Some(last_root) = inserted_roots.last() {
                     let focus_block = if last_root.read(cx).kind() == BlockKind::Table {
                         last_root
@@ -1680,6 +1949,14 @@ impl Editor {
 
                 if quote_related {
                     self.normalize_rendered_quote_structure(cx);
+                }
+
+                // Quote normalization rebuilds roots from Markdown, so resolve the
+                // landing block from the live tree rather than the pasted handles.
+                if inserted_at_doc_end {
+                    if let Some(last_root) = self.document.root_blocks().last().cloned() {
+                        self.ensure_trailing_paragraph_after_structural(&last_root, cx);
+                    }
                 }
                 self.mark_dirty(cx);
                 self.finalize_pending_undo_capture(cx);
@@ -2515,6 +2792,345 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn setext_equals_underline_enter_promotes_previous_paragraph_to_h1(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let editor = cx.new(|cx| Editor::from_markdown(cx, "Title\n\n=====".to_string(), None));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let underline = editor.document.visible_blocks()[1].entity.clone();
+                underline.update(cx, |block, block_cx| {
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let visible = editor.document.visible_blocks();
+            assert_eq!(visible.len(), 2);
+            assert_eq!(
+                visible[0].entity.read(cx).kind(),
+                BlockKind::Heading { level: 1 }
+            );
+            assert_eq!(visible[0].entity.read(cx).display_text(), "Title");
+            assert_eq!(visible[1].entity.read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(visible[1].entity.read(cx).display_text(), "");
+            assert_eq!(editor.document.markdown_text(cx), "# Title\n\n");
+        });
+
+        // Reversible: undo restores the two original paragraphs.
+        editor.update(cx, |editor, cx| {
+            editor.undo_document(cx);
+            assert_eq!(editor.document.markdown_text(cx), "Title\n\n=====");
+        });
+    }
+
+    #[gpui::test]
+    async fn setext_dash_underline_enter_promotes_previous_paragraph_to_h2(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        // A bare "-----" in source parses as a thematic break, so simulate the
+        // user typing the underline into the paragraph below the title instead.
+        let editor = cx.new(|cx| Editor::from_markdown(cx, "Title\n\nx".to_string(), None));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let underline = editor.document.visible_blocks()[1].entity.clone();
+                underline.update(cx, |block, block_cx| {
+                    let end = block.visible_len();
+                    block.replace_text_in_visible_range(0..end, "-----", None, false, block_cx);
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let visible = editor.document.visible_blocks();
+            assert_eq!(
+                visible[0].entity.read(cx).kind(),
+                BlockKind::Heading { level: 2 }
+            );
+            assert_eq!(visible[0].entity.read(cx).display_text(), "Title");
+            assert_eq!(editor.document.markdown_text(cx), "## Title\n\n");
+        });
+    }
+
+    #[gpui::test]
+    async fn dash_underline_without_heading_target_stays_a_separator(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let editor = cx.new(|cx| Editor::from_markdown(cx, String::new(), None));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let block = editor.document.visible_blocks()[0].entity.clone();
+                block.update(cx, |block, block_cx| {
+                    block.replace_text_in_visible_range(0..0, "-----", None, false, block_cx);
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let visible = editor.document.visible_blocks();
+            assert_eq!(visible[0].entity.read(cx).kind(), BlockKind::Separator);
+        });
+    }
+
+    #[gpui::test]
+    async fn equals_underline_without_heading_target_stays_a_paragraph(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let editor = cx.new(|cx| Editor::from_markdown(cx, String::new(), None));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let block = editor.document.visible_blocks()[0].entity.clone();
+                block.update(cx, |block, block_cx| {
+                    block.replace_text_in_visible_range(0..0, "=====", None, false, block_cx);
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let visible = editor.document.visible_blocks();
+            assert_eq!(visible[0].entity.read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(visible[0].entity.read(cx).display_text(), "=====");
+        });
+    }
+
+    #[gpui::test]
+    async fn delimiter_row_enter_forms_native_table(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let editor = cx.new(|cx| {
+            Editor::from_markdown(cx, "| Name | Score |\n\n| --- | --- |".to_string(), None)
+        });
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let delimiter = editor.document.root_blocks()[1].clone();
+                delimiter.update(cx, |block, block_cx| {
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let roots = editor.document.root_blocks();
+            assert_eq!(roots.len(), 2);
+            assert_eq!(roots[0].read(cx).kind(), BlockKind::Table);
+            let table = roots[0].read(cx).record.table.clone().expect("table");
+            assert_eq!(table.header.len(), 2);
+            assert_eq!(table.header[0].serialize_markdown(), "Name");
+            assert!(table.rows.is_empty());
+            assert_eq!(roots[1].read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(
+                editor.document.markdown_text(cx),
+                "| Name | Score |\n| --- | --- |\n\n"
+            );
+        });
+
+        // Reversible in one step back to the two source paragraphs.
+        editor.update(cx, |editor, cx| {
+            editor.undo_document(cx);
+            assert_eq!(
+                editor.document.markdown_text(cx),
+                "| Name | Score |\n\n| --- | --- |"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn pipe_row_below_table_is_absorbed_as_a_row(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let editor = cx.new(|cx| {
+            Editor::from_markdown(cx, "| Name | Score |\n\n| --- | --- |".to_string(), None)
+        });
+
+        // Form the table.
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let delimiter = editor.document.root_blocks()[1].clone();
+                delimiter.update(cx, |block, block_cx| {
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        // Type a body row into the paragraph below the table and press Enter.
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let row = editor.document.root_blocks()[1].clone();
+                row.update(cx, |block, block_cx| {
+                    block.replace_text_in_visible_range(
+                        0..0,
+                        "| Alice | 10 |",
+                        None,
+                        false,
+                        block_cx,
+                    );
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let roots = editor.document.root_blocks();
+            assert_eq!(roots[0].read(cx).kind(), BlockKind::Table);
+            let table = roots[0].read(cx).record.table.clone().expect("table");
+            assert_eq!(table.rows.len(), 1);
+            assert_eq!(table.rows[0][0].serialize_markdown(), "Alice");
+            assert_eq!(table.rows[0][1].serialize_markdown(), "10");
+            assert_eq!(roots[1].read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(roots[1].read(cx).display_text(), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn pipeless_delimiter_row_enter_forms_native_table(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let editor =
+            cx.new(|cx| Editor::from_markdown(cx, "Name | Score\n\n---- | ----".to_string(), None));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let delimiter = editor.document.root_blocks()[1].clone();
+                delimiter.update(cx, |block, block_cx| {
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let roots = editor.document.root_blocks();
+            assert_eq!(roots.len(), 2);
+            assert_eq!(roots[0].read(cx).kind(), BlockKind::Table);
+            let table = roots[0].read(cx).record.table.clone().expect("table");
+            assert_eq!(table.header.len(), 2);
+            assert_eq!(table.header[0].serialize_markdown(), "Name");
+            assert_eq!(table.header[1].serialize_markdown(), "Score");
+            assert!(table.rows.is_empty());
+            assert_eq!(roots[1].read(cx).kind(), BlockKind::Paragraph);
+        });
+    }
+
+    #[gpui::test]
+    async fn pipeless_row_below_table_is_absorbed_as_a_row(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let editor =
+            cx.new(|cx| Editor::from_markdown(cx, "Name | Score\n\n---- | ----".to_string(), None));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let delimiter = editor.document.root_blocks()[1].clone();
+                delimiter.update(cx, |block, block_cx| {
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        // A pipeless body row with the table's column count is absorbed.
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let row = editor.document.root_blocks()[1].clone();
+                row.update(cx, |block, block_cx| {
+                    block.replace_text_in_visible_range(0..0, "Alice | 10", None, false, block_cx);
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let roots = editor.document.root_blocks();
+            assert_eq!(roots[0].read(cx).kind(), BlockKind::Table);
+            let table = roots[0].read(cx).record.table.clone().expect("table");
+            assert_eq!(table.rows.len(), 1);
+            assert_eq!(table.rows[0][0].serialize_markdown(), "Alice");
+            assert_eq!(table.rows[0][1].serialize_markdown(), "10");
+            assert_eq!(roots[1].read(cx).kind(), BlockKind::Paragraph);
+        });
+    }
+
+    #[gpui::test]
+    async fn ragged_pipeless_row_below_table_is_padded_to_width(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let editor = cx
+            .new(|cx| Editor::from_markdown(cx, "A | B | C\n\n--- | --- | ---".to_string(), None));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let delimiter = editor.document.root_blocks()[1].clone();
+                delimiter.update(cx, |block, block_cx| {
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        // Two cells typed under a three-column table: absorbed as a row and
+        // padded to the header width, matching how pasted ragged rows behave.
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let row = editor.document.root_blocks()[1].clone();
+                row.update(cx, |block, block_cx| {
+                    block.replace_text_in_visible_range(0..0, "one | two", None, false, block_cx);
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let table = editor.document.root_blocks()[0]
+                .read(cx)
+                .record
+                .table
+                .clone()
+                .expect("table");
+            assert_eq!(table.rows.len(), 1);
+            assert_eq!(table.rows[0].len(), 3);
+            assert_eq!(table.rows[0][0].serialize_markdown(), "one");
+            assert_eq!(table.rows[0][1].serialize_markdown(), "two");
+            assert_eq!(table.rows[0][2].serialize_markdown(), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn lone_pipe_row_without_table_context_stays_a_paragraph(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let editor = cx.new(|cx| Editor::from_markdown(cx, String::new(), None));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let block = editor.document.root_blocks()[0].clone();
+                block.update(cx, |block, block_cx| {
+                    block.replace_text_in_visible_range(0..0, "| a | b |", None, false, block_cx);
+                    block.move_to(block.visible_len(), block_cx);
+                    block.on_newline(&Newline, window, block_cx);
+                });
+            });
+        });
+
+        editor.update(cx, |editor, cx| {
+            let roots = editor.document.root_blocks();
+            assert_eq!(roots[0].read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(roots[0].read(cx).display_text(), "| a | b |");
+        });
+    }
+
+    #[gpui::test]
     async fn math_block_exit_shortcut_creates_plain_text_block(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
         let editor = cx.new(|cx| Editor::from_markdown(cx, "$$n^2$$".to_string(), None));
@@ -3012,9 +3628,11 @@ mod tests {
 
             // The header row must survive: previously the first pasted line was
             // folded into the paragraph, leaving the alignment row to masquerade
-            // as the header. The empty paste target is also dropped.
+            // as the header. The empty paste target is also dropped, and a
+            // trailing paragraph is added so the document does not end on the
+            // table with no line below it.
             let visible = editor.document.visible_blocks();
-            assert_eq!(visible.len(), 1);
+            assert_eq!(visible.len(), 2);
             let table = visible[0].entity.read(cx);
             assert_eq!(table.kind(), BlockKind::Table);
             let data = table.record.table.as_ref().expect("table data");
@@ -3023,6 +3641,8 @@ mod tests {
             assert_eq!(data.rows.len(), 1);
             assert_eq!(data.rows[0][0].serialize_markdown(), "1");
             assert_eq!(data.rows[0][1].serialize_markdown(), "2");
+            assert_eq!(visible[1].entity.read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(visible[1].entity.read(cx).display_text(), "");
         });
     }
 
@@ -3050,9 +3670,10 @@ mod tests {
             // The fence is structural, so the whole paste goes through the block
             // importer rather than the plain-text path: the opening ```rust line is
             // no longer folded into a paragraph, and the empty paste target is
-            // dropped, leaving a single native code block.
+            // dropped. A trailing paragraph is added so the document does not end
+            // on the code block with no line below it.
             let visible = editor.document.visible_blocks();
-            assert_eq!(visible.len(), 1);
+            assert_eq!(visible.len(), 2);
             let code = visible[0].entity.read(cx);
             assert_eq!(
                 code.kind(),
@@ -3061,9 +3682,10 @@ mod tests {
                 }
             );
             assert_eq!(code.display_text(), "fn main() {}");
+            assert_eq!(visible[1].entity.read(cx).kind(), BlockKind::Paragraph);
             assert_eq!(
                 editor.document.markdown_text(cx),
-                "```rust\nfn main() {}\n```"
+                "```rust\nfn main() {}\n```\n\n"
             );
         });
     }
@@ -3137,6 +3759,166 @@ mod tests {
             assert_eq!(visible[1].entity.read(cx).display_text(), "fn main() {}");
             assert_eq!(visible[2].entity.read(cx).kind(), BlockKind::Paragraph);
             assert_eq!(visible[2].entity.read(cx).display_text(), "after");
+            // Text already follows the code block, so no extra trailing
+            // paragraph is added mid-document.
+        });
+    }
+
+    #[gpui::test]
+    async fn structural_paste_at_document_end_adds_one_trailing_paragraph(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| Editor::from_markdown(cx, "intro".into(), None));
+
+        editor.update(cx, |editor, cx| {
+            let block = editor.document.visible_blocks()[0].entity.clone();
+            block.update(cx, |block, _cx| {
+                block.selected_range = block.visible_len()..block.visible_len();
+            });
+            editor.on_block_event(
+                block,
+                &BlockEvent::RequestPasteMultiline {
+                    leading: InlineTextTree::plain("intro"),
+                    lines: vec!["***".to_string()],
+                    trailing: InlineTextTree::plain(String::new()),
+                    split_physical_lines: false,
+                },
+                cx,
+            );
+
+            let visible = editor.document.visible_blocks();
+            assert_eq!(visible.len(), 3);
+            assert_eq!(visible[0].entity.read(cx).display_text(), "intro");
+            assert_eq!(visible[1].entity.read(cx).kind(), BlockKind::Separator);
+            assert_eq!(visible[2].entity.read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(visible[2].entity.read(cx).display_text(), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn structural_paste_of_quote_at_document_end_adds_trailing_paragraph(
+        cx: &mut TestAppContext,
+    ) {
+        let editor = cx.new(|cx| Editor::from_markdown(cx, "intro".into(), None));
+
+        editor.update(cx, |editor, cx| {
+            let block = editor.document.visible_blocks()[0].entity.clone();
+            block.update(cx, |block, _cx| {
+                block.selected_range = block.visible_len()..block.visible_len();
+            });
+            editor.on_block_event(
+                block,
+                &BlockEvent::RequestPasteMultiline {
+                    leading: InlineTextTree::plain("intro"),
+                    lines: vec!["> quoted".to_string()],
+                    trailing: InlineTextTree::plain(String::new()),
+                    split_physical_lines: false,
+                },
+                cx,
+            );
+
+            // The quote container cannot hold the caret below it, so a trailing
+            // paragraph is added even though quote normalization re-parses the
+            // whole document on the way.
+            let roots = editor.document.root_blocks();
+            assert_eq!(roots.len(), 3);
+            assert_eq!(roots[0].read(cx).display_text(), "intro");
+            assert_eq!(roots[1].read(cx).kind(), BlockKind::Quote);
+            assert_eq!(roots[2].read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(roots[2].read(cx).display_text(), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn structural_paste_of_callout_at_document_end_adds_trailing_paragraph(
+        cx: &mut TestAppContext,
+    ) {
+        let editor = cx.new(|cx| Editor::from_markdown(cx, "intro".into(), None));
+
+        editor.update(cx, |editor, cx| {
+            let block = editor.document.visible_blocks()[0].entity.clone();
+            block.update(cx, |block, _cx| {
+                block.selected_range = block.visible_len()..block.visible_len();
+            });
+            editor.on_block_event(
+                block,
+                &BlockEvent::RequestPasteMultiline {
+                    leading: InlineTextTree::plain("intro"),
+                    lines: vec!["> [!NOTE]".to_string(), "> body".to_string()],
+                    trailing: InlineTextTree::plain(String::new()),
+                    split_physical_lines: false,
+                },
+                cx,
+            );
+
+            let roots = editor.document.root_blocks();
+            assert_eq!(roots.len(), 3);
+            assert_eq!(
+                roots[1].read(cx).kind(),
+                BlockKind::Callout(CalloutVariant::Note)
+            );
+            assert_eq!(roots[2].read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(roots[2].read(cx).display_text(), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn structural_paste_of_footnote_definition_at_document_end_adds_trailing_paragraph(
+        cx: &mut TestAppContext,
+    ) {
+        let editor = cx.new(|cx| Editor::from_markdown(cx, "intro".into(), None));
+
+        editor.update(cx, |editor, cx| {
+            let block = editor.document.visible_blocks()[0].entity.clone();
+            block.update(cx, |block, _cx| {
+                block.selected_range = block.visible_len()..block.visible_len();
+            });
+            editor.on_block_event(
+                block,
+                &BlockEvent::RequestPasteMultiline {
+                    leading: InlineTextTree::plain("intro"),
+                    lines: vec!["[^note]: definition body".to_string()],
+                    trailing: InlineTextTree::plain(String::new()),
+                    split_physical_lines: false,
+                },
+                cx,
+            );
+
+            let roots = editor.document.root_blocks();
+            assert_eq!(roots.len(), 3);
+            assert_eq!(roots[1].read(cx).kind(), BlockKind::FootnoteDefinition);
+            assert_eq!(roots[2].read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(roots[2].read(cx).display_text(), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn structural_paste_of_standalone_image_at_document_end_adds_trailing_paragraph(
+        cx: &mut TestAppContext,
+    ) {
+        let editor = cx.new(|cx| Editor::from_markdown(cx, "intro".into(), None));
+
+        editor.update(cx, |editor, cx| {
+            let block = editor.document.visible_blocks()[0].entity.clone();
+            block.update(cx, |block, _cx| {
+                block.selected_range = block.visible_len()..block.visible_len();
+            });
+            editor.on_block_event(
+                block,
+                &BlockEvent::RequestPasteMultiline {
+                    leading: InlineTextTree::plain("intro"),
+                    lines: vec!["![alt](pic.png)".to_string()],
+                    trailing: InlineTextTree::plain(String::new()),
+                    split_physical_lines: false,
+                },
+                cx,
+            );
+
+            // A lone image renders as a self-contained widget, so it gets the
+            // same trailing paragraph even though it is a paragraph block.
+            let roots = editor.document.root_blocks();
+            assert_eq!(roots.len(), 3);
+            assert!(roots[1].read(cx).renders_as_standalone_image());
+            assert_eq!(roots[2].read(cx).kind(), BlockKind::Paragraph);
+            assert_eq!(roots[2].read(cx).display_text(), "");
         });
     }
 

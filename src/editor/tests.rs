@@ -902,7 +902,7 @@ async fn append_column_updates_table_and_focuses_new_header_cell(cx: &mut TestAp
         assert_eq!(
             record.alignments,
             vec![
-                TableColumnAlignment::Left,
+                TableColumnAlignment::Default,
                 TableColumnAlignment::Right,
                 TableColumnAlignment::Right,
             ]
@@ -963,7 +963,7 @@ async fn setting_column_alignment_updates_record_and_selection(cx: &mut TestAppC
         let record = table.read(cx).record.table.as_ref().expect("table record");
         assert_eq!(
             record.alignments,
-            vec![TableColumnAlignment::Left, TableColumnAlignment::Right]
+            vec![TableColumnAlignment::Default, TableColumnAlignment::Right]
         );
         assert_eq!(
             editor.table_axis_selection,
@@ -1181,6 +1181,70 @@ async fn deleting_table_header_promotes_next_row(cx: &mut TestAppContext) {
             .as_ref()
             .expect("rebuilt runtime");
         assert_eq!(editor.pending_focus, Some(runtime.header[0].entity_id()));
+    });
+}
+
+#[gpui::test]
+async fn deleting_last_body_row_leaves_header_only_table(cx: &mut TestAppContext) {
+    let markdown = ["| A | B |", "| --- | --- |", "| 1 | 2 |"].join("\n");
+    let editor = cx.new(|cx| Editor::from_markdown(cx, markdown, None));
+
+    editor.update(cx, |editor, cx| {
+        let table = editor.document.first_root().expect("table root").clone();
+        // Deleting the only body row used to be blocked; now it leaves a
+        // header-only table behind.
+        editor.delete_table_row(&table, 0, cx);
+
+        let record = table.read(cx).record.table.as_ref().expect("table record");
+        assert!(record.rows.is_empty());
+        assert_eq!(record.header[0].serialize_markdown(), "A");
+        assert_eq!(editor.document.root_count(), 1);
+        assert_eq!(table.read(cx).kind(), BlockKind::Table);
+    });
+}
+
+#[gpui::test]
+async fn removing_table_block_replaces_it_with_empty_paragraph(cx: &mut TestAppContext) {
+    let markdown = [
+        "intro",
+        "",
+        "| A | B |",
+        "| --- | --- |",
+        "| 1 | 2 |",
+        "",
+        "outro",
+    ]
+    .join("\n");
+    let editor = cx.new(|cx| Editor::from_markdown(cx, markdown, None));
+
+    editor.update(cx, |editor, cx| {
+        let table = editor.document.root_blocks()[1].clone();
+        assert_eq!(table.read(cx).kind(), BlockKind::Table);
+        editor.remove_table_block(&table, cx);
+
+        let roots = editor.document.root_blocks();
+        assert_eq!(roots.len(), 3);
+        assert_eq!(roots[0].read(cx).display_text(), "intro");
+        assert_eq!(roots[1].read(cx).kind(), BlockKind::Paragraph);
+        assert_eq!(roots[1].read(cx).display_text(), "");
+        assert_eq!(roots[2].read(cx).display_text(), "outro");
+        assert_eq!(editor.pending_focus, Some(roots[1].entity_id()));
+    });
+}
+
+#[gpui::test]
+async fn removing_the_only_table_leaves_one_empty_paragraph(cx: &mut TestAppContext) {
+    let markdown = ["| A | B |", "| --- | --- |", "| 1 | 2 |"].join("\n");
+    let editor = cx.new(|cx| Editor::from_markdown(cx, markdown, None));
+
+    editor.update(cx, |editor, cx| {
+        let table = editor.document.first_root().expect("table root").clone();
+        editor.remove_table_block(&table, cx);
+
+        let roots = editor.document.root_blocks();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].read(cx).kind(), BlockKind::Paragraph);
+        assert_eq!(roots[0].read(cx).display_text(), "");
     });
 }
 

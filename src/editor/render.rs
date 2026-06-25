@@ -9,7 +9,11 @@ use gpui::*;
 use super::{Editor, InfoDialogKind, workspace::workspace_panel_width_for_viewport};
 use crate::app_menu::dispatch_menu_action_for_editor;
 use crate::components::CalloutVariant;
-use crate::components::{AddLanguageConfig, AddThemeConfig, Block, BlockKind, NoRecentFiles};
+use crate::components::{
+    AddLanguageConfig, AddThemeConfig, Block, BlockKind, NoRecentFiles, ShortcutCategory,
+    ToggleWhichKey, resolved_shortcut_keys, shortcut_definitions,
+};
+use crate::config::read_app_preferences;
 use crate::i18n::{I18nManager, I18nStrings};
 use crate::theme::{Theme, ThemeDimensions, ThemeManager};
 use crate::window_chrome::{custom_titlebar_height, render_custom_titlebar};
@@ -56,6 +60,30 @@ fn tibetan_font_fallbacks_for_target_os(target_os: &str) -> Vec<String> {
         .iter()
         .map(|family| (*family).to_string())
         .collect()
+}
+
+fn which_key_category_label(category: ShortcutCategory) -> &'static str {
+    match category {
+        ShortcutCategory::File => "File",
+        ShortcutCategory::Edit => "Edit",
+        ShortcutCategory::Navigation => "Navigation",
+        ShortcutCategory::Formatting => "Formatting",
+        ShortcutCategory::Block => "Block",
+        ShortcutCategory::Other => "Other",
+    }
+}
+
+fn which_key_command_label(id: &str) -> String {
+    id.split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Adjacent-row metadata used to collapse spacing inside visual groups.
@@ -1505,6 +1533,128 @@ impl Editor {
                     ),
             )
     }
+
+    pub(crate) fn on_toggle_which_key_action(
+        &mut self,
+        _: &ToggleWhichKey,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_which_key = !self.show_which_key;
+        cx.notify();
+    }
+
+    fn render_which_key_overlay(
+        &self,
+        theme: &Theme,
+        _cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.show_which_key {
+            return None;
+        }
+
+        let c = &theme.colors;
+        let d = &theme.dimensions;
+        let t = &theme.typography;
+        let preferences = read_app_preferences().unwrap_or_default();
+        if !preferences.which_key.enable {
+            return None;
+        }
+        let keybindings = preferences.effective_keybindings();
+
+        let mut panel = div()
+            .id("which-key-panel")
+            .w(px(720.0))
+            .max_w(relative(0.92))
+            .max_h(relative(0.82))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(d.dialog_gap))
+            .p(px(d.dialog_padding))
+            .bg(c.dialog_surface)
+            .border(px(d.dialog_border_width))
+            .border_color(c.dialog_border)
+            .rounded(px(d.dialog_radius))
+            .shadow_lg()
+            .child(
+                div()
+                    .text_size(px(t.dialog_title_size))
+                    .font_weight(t.dialog_title_weight.to_font_weight())
+                    .text_color(c.dialog_title)
+                    .child("Keyboard shortcuts"),
+            )
+            .child(
+                div()
+                    .text_size(px(t.dialog_body_size))
+                    .text_color(c.dialog_muted)
+                    .child("Press Esc or the trigger again to dismiss."),
+            );
+
+        for category in [
+            ShortcutCategory::File,
+            ShortcutCategory::Edit,
+            ShortcutCategory::Navigation,
+            ShortcutCategory::Formatting,
+            ShortcutCategory::Block,
+            ShortcutCategory::Other,
+        ] {
+            let mut section = div().flex().flex_col().gap(px(6.0)).child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(px(t.dialog_body_size))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(c.dialog_title)
+                    .child(which_key_category_label(category)),
+            );
+            for definition in shortcut_definitions()
+                .iter()
+                .filter(|definition| definition.category == category)
+            {
+                let keys = resolved_shortcut_keys(&keybindings, definition.command);
+                if keys.is_empty() {
+                    continue;
+                }
+                section = section.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(16.0))
+                        .child(
+                            div()
+                                .text_size(px(t.dialog_body_size))
+                                .text_color(c.dialog_body)
+                                .child(which_key_command_label(definition.id)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(t.dialog_body_size))
+                                .text_color(c.dialog_muted)
+                                .child(keys.join(", ")),
+                        ),
+                );
+            }
+            panel = panel.child(section);
+        }
+
+        Some(
+            div()
+                .id("which-key-overlay")
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(c.dialog_backdrop)
+                .child(panel)
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for Editor {
@@ -1936,6 +2086,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_quit_application))
             .on_action(cx.listener(Self::on_close_window))
             .on_action(cx.listener(Self::on_toggle_view_mode_action))
+            .on_action(cx.listener(Self::on_toggle_which_key_action))
             .on_action(cx.listener(Self::on_toggle_workspace_action))
             .on_action(cx.listener(Self::on_page_up))
             .on_action(cx.listener(Self::on_page_down))
@@ -2017,6 +2168,11 @@ impl Render for Editor {
         };
         let base = if let Some(table_dialog) = self.render_table_insert_dialog_overlay(&theme, cx) {
             base.child(table_dialog)
+        } else {
+            base
+        };
+        let base = if let Some(which_key) = self.render_which_key_overlay(&theme, cx) {
+            base.child(which_key)
         } else {
             base
         };

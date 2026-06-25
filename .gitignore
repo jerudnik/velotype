@@ -1,3 +1,23 @@
+/result
+/result-*
 /target
 .DS_Store
 /dist
+.direnv
+
+# Manual export validation artifacts
+/assets/validation/
+
+# APM-generated agent surfaces
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+/.agents/
+/.claude/rules/
+/.codex/
+/.gemini/
+/.github/instructions/
+/.mcp.json
+
+# APM dependencies
+apm_modules/

@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
+
 use crate::theme::Theme;
 
 mod html;
@@ -28,9 +30,40 @@ impl ExportFormat {
             Self::Pdf => "pdf",
         }
     }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "html" => Some(Self::Html),
+            "pdf" => Some(Self::Pdf),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) use html::render_html_with_base_dir;
+
+pub(crate) fn export_document_file(
+    input: &Path,
+    output: &Path,
+    format: ExportFormat,
+    theme: &Theme,
+) -> anyhow::Result<()> {
+    let markdown = std::fs::read_to_string(input)
+        .with_context(|| format!("failed to read '{}'", input.display()))?;
+    let title = input
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("Untitled");
+    let base_path = input.parent();
+    let bytes = match format {
+        ExportFormat::Html => {
+            render_html_with_base_dir(&markdown, theme, title, base_path).into_bytes()
+        }
+        ExportFormat::Pdf => render_pdf(&markdown, theme, title, base_path)?,
+    };
+    std::fs::write(output, bytes).with_context(|| format!("failed to write '{}'", output.display()))
+}
 
 /// Renders themed PDF bytes for the current document Markdown.
 pub(crate) fn render_pdf(

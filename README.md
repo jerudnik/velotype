@@ -96,6 +96,41 @@ cargo build --release
 
 If everything works, the build artifact will be stored under `target/release`. You can use the executable directly.
 
+## Nix flake integration
+
+This fork exposes its Nix integration as reusable flake surface area so downstream
+configs can consume the fork directly instead of duplicating package or Home
+Manager glue. See [`docs/fork-ledger.md`](docs/fork-ledger.md) for the fork
+branch, remote, patch-ledger, and downstream-consumption conventions.
+
+Stable outputs:
+
+- `packages.${system}.default` and `packages.${system}.velotype`: the wrapped Velotype package.
+- `apps.${system}.default` and `apps.${system}.velotype`: `nix run` entrypoints for the package.
+- `overlays.default`: adds `pkgs.velotype`.
+- `homeModules.default` / `homeModules.velotype`: Home Manager module for `programs.velotype`.
+- `homeManagerModules.default` / `homeManagerModules.velotype`: alias for consumers that prefer the conventional Home Manager output name.
+
+For a patchable local fork checkout, downstream flakes can use:
+
+```nix
+inputs.velotype.url = "git+file:///home/john/infrastructure/velotype";
+```
+
+Then import the module and select the package from this fork:
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  imports = [ inputs.velotype.homeManagerModules.default ];
+
+  programs.velotype = {
+    enable = true;
+    package = inputs.velotype.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  };
+}
+```
+
 ## Roadmap
 
 Velotype already supports almost all basic Markdown syntax and most commonly used extended Markdown syntax, including headings, paragraphs, lists, task lists, quotes, callouts, tables, code blocks, inline formatting, links, reference-style links and images, footnotes, standalone images, comment blocks, and safe native HTML handling.

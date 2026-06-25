@@ -1,0 +1,17 @@
+lockfile_version: '1'
+generated_at: '2026-06-23T04:43:06.559295+00:00'
+dependencies: []
+local_deployed_files:
+- .claude/rules/dox-apm.md
+- .claude/rules/dox.md
+- .claude/rules/fork-branch-rails.md
+- .github/instructions/dox-apm.instructions.md
+- .github/instructions/dox.instructions.md
+- .github/instructions/fork-branch-rails.instructions.md
+local_deployed_file_hashes:
+  .claude/rules/dox-apm.md: sha256:7aab324a6650085adfb297f97545fba725b7b41f17e4d887c4d76bfa8bd9dc64
+  .claude/rules/dox.md: sha256:efeb9841e4c1144da4f6d2c5046644b17f33eb49e8383a98a1481eebd0c56a0b
+  .claude/rules/fork-branch-rails.md: sha256:bcc10e8ed5b233d3d7b42d22be4b6c8aa73c79721d2a589127bc13d48deb35c5
+  .github/instructions/dox-apm.instructions.md: sha256:ad2e058c5a4a5fad7d5d0760ffa24e0d69c7620cb8d3fd20b1790235507b22a9
+  .github/instructions/dox.instructions.md: sha256:256ec256ebe4ea2524c180940913a7a4288f130fd213cfee69ca85483f58ddbd
+  .github/instructions/fork-branch-rails.instructions.md: sha256:f892376983eca66281e49954639b93bbdf703c7a5dc088c9bc6964a9ecfabb5e

@@ -256,6 +256,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.show_which_key {
+            self.show_which_key = false;
+        }
         self.dismiss_contextual_overlays(cx);
     }
 

@@ -1,0 +1,15 @@
+name: velotype
+version: 1.0.0
+description: APM project for Velotype fork-local agent instructions
+author: john rudnik
+targets:
+- claude
+- codex
+- copilot
+- gemini
+- agent-skills
+dependencies:
+  apm: []
+  mcp: []
+includes: auto
+scripts: {}

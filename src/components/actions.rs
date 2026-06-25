@@ -71,6 +71,7 @@ actions!(
         DismissTransientUi,
         ToggleViewMode,
         ToggleWorkspace,
+        ToggleWhichKey,
     ]
 );
 
@@ -161,6 +162,7 @@ pub(crate) enum ShortcutCommand {
     DismissTransientUi,
     ToggleViewMode,
     ToggleWorkspace,
+    ToggleWhichKey,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -524,6 +526,13 @@ const SHORTCUT_DEFINITIONS: &[ShortcutDefinition] = &[
         default_keys: &["ctrl-w"],
         context: None,
     },
+    ShortcutDefinition {
+        command: ShortcutCommand::ToggleWhichKey,
+        id: "toggle_which_key",
+        category: ShortcutCategory::Other,
+        default_keys: &["ctrl-space"],
+        context: None,
+    },
 ];
 
 pub(crate) fn shortcut_definitions() -> &'static [ShortcutDefinition] {
@@ -733,6 +742,7 @@ fn key_binding_for(
         ShortcutCommand::DismissTransientUi => KeyBinding::new(key, DismissTransientUi, context),
         ShortcutCommand::ToggleViewMode => KeyBinding::new(key, ToggleViewMode, context),
         ShortcutCommand::ToggleWorkspace => KeyBinding::new(key, ToggleWorkspace, context),
+        ShortcutCommand::ToggleWhichKey => KeyBinding::new(key, ToggleWhichKey, context),
     }
 }
 

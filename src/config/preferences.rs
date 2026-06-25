@@ -75,6 +75,58 @@ impl ImagePasteBehavior {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageNamingStrategy {
+    OriginalCounter,
+    SlugCounter,
+}
+
+impl ImageNamingStrategy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OriginalCounter => "original-counter",
+            Self::SlugCounter => "slug-counter",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        match value {
+            "slug-counter" => Self::SlugCounter,
+            _ => Self::OriginalCounter,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImagePasteSettings {
+    pub(crate) asset_dir: PathBuf,
+    pub(crate) naming: ImageNamingStrategy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MarkdownExtensionPreferences {
+    pub(crate) frontmatter: bool,
+    pub(crate) wikilinks: bool,
+}
+
+impl Default for MarkdownExtensionPreferences {
+    fn default() -> Self {
+        Self {
+            frontmatter: true,
+            wikilinks: true,
+        }
+    }
+}
+
+impl Default for ImagePasteSettings {
+    fn default() -> Self {
+        Self {
+            asset_dir: PathBuf::from("assets"),
+            naming: ImageNamingStrategy::OriginalCounter,
+        }
+    }
+}
+
 /// User preferences persisted under the app config directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppPreferences {
@@ -83,7 +135,27 @@ pub(crate) struct AppPreferences {
     pub(crate) default_theme_id: String,
     pub(crate) show_table_headers: bool,
     pub(crate) image_paste_behavior: ImagePasteBehavior,
+    pub(crate) image_paste: ImagePasteSettings,
     pub(crate) keybindings: BTreeMap<String, Vec<String>>,
+    pub(crate) keybinding_profile: Option<String>,
+    pub(crate) keybinding_profiles: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    pub(crate) which_key: WhichKeyPreferences,
+    pub(crate) markdown_extensions: MarkdownExtensionPreferences,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WhichKeyPreferences {
+    pub(crate) enable: bool,
+    pub(crate) trigger: Vec<String>,
+}
+
+impl Default for WhichKeyPreferences {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            trigger: vec!["ctrl-space".into()],
+        }
+    }
 }
 
 impl Default for AppPreferences {
@@ -94,8 +166,29 @@ impl Default for AppPreferences {
             default_theme_id: DEFAULT_THEME_ID.into(),
             show_table_headers: true,
             image_paste_behavior: ImagePasteBehavior::None,
+            image_paste: ImagePasteSettings::default(),
             keybindings: BTreeMap::new(),
+            keybinding_profile: None,
+            keybinding_profiles: BTreeMap::new(),
+            which_key: WhichKeyPreferences::default(),
+            markdown_extensions: MarkdownExtensionPreferences::default(),
         }
+    }
+}
+
+impl AppPreferences {
+    pub(crate) fn effective_keybindings(&self) -> BTreeMap<String, Vec<String>> {
+        let mut keybindings = self.keybindings.clone();
+        if let Some(profile) = self.keybinding_profile.as_ref().and_then(|profile| {
+            self.keybinding_profiles
+                .get(profile)
+                .or_else(|| self.keybinding_profiles.get(profile.trim()))
+        }) {
+            for (id, keys) in profile {
+                keybindings.insert(id.clone(), keys.clone());
+            }
+        }
+        keybindings
     }
 }
 
@@ -141,7 +234,12 @@ struct PreferencesFile {
     language: LanguagePreferencesFile,
     theme: ThemePreferencesFile,
     editor: EditorPreferencesFile,
+    images: ImagesPreferencesFile,
     keybindings: BTreeMap<String, Vec<String>>,
+    keybinding_profile: Option<String>,
+    keybinding_profiles: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    which_key: WhichKeyPreferencesFile,
+    markdown_extensions: MarkdownExtensionPreferencesFile,
 }
 
 #[derive(Serialize)]
@@ -156,6 +254,12 @@ struct EditorPreferencesFile {
 }
 
 #[derive(Serialize)]
+struct ImagesPreferencesFile {
+    asset_dir: String,
+    naming: String,
+}
+
+#[derive(Serialize)]
 struct LanguagePreferencesFile {
     default_language_id: String,
 }
@@ -163,6 +267,18 @@ struct LanguagePreferencesFile {
 #[derive(Serialize)]
 struct ThemePreferencesFile {
     default_theme_id: String,
+}
+
+#[derive(Serialize)]
+struct WhichKeyPreferencesFile {
+    enable: bool,
+    trigger: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct MarkdownExtensionPreferencesFile {
+    frontmatter: bool,
+    wikilinks: bool,
 }
 
 impl From<&AppPreferences> for PreferencesFile {
@@ -181,7 +297,25 @@ impl From<&AppPreferences> for PreferencesFile {
                 show_table_headers: value.show_table_headers,
                 image_paste_behavior: value.image_paste_behavior.as_str().into(),
             },
+            images: ImagesPreferencesFile {
+                asset_dir: value.image_paste.asset_dir.to_string_lossy().to_string(),
+                naming: value.image_paste.naming.as_str().into(),
+            },
             keybindings: normalize_shortcut_config(&value.keybindings),
+            keybinding_profile: value.keybinding_profile.clone(),
+            keybinding_profiles: value
+                .keybinding_profiles
+                .iter()
+                .map(|(name, profile)| (name.clone(), normalize_shortcut_config(profile)))
+                .collect(),
+            which_key: WhichKeyPreferencesFile {
+                enable: value.which_key.enable,
+                trigger: value.which_key.trigger.clone(),
+            },
+            markdown_extensions: MarkdownExtensionPreferencesFile {
+                frontmatter: value.markdown_extensions.frontmatter,
+                wikilinks: value.markdown_extensions.wikilinks,
+            },
         }
     }
 }
@@ -259,6 +393,36 @@ fn app_preferences_from_toml_value(
         })
         .map(|keybindings| normalize_shortcut_config(&keybindings))
         .unwrap_or_default();
+    let keybinding_profile = value
+        .get("keybinding_profile")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(str::to_string);
+    let keybinding_profiles = value
+        .get("keybinding_profiles")
+        .and_then(|profiles| profiles.as_table())
+        .map(|profiles| {
+            profiles
+                .iter()
+                .filter_map(|(name, profile)| {
+                    let table = profile.as_table()?;
+                    let keybindings = table
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            let keys = value
+                                .as_array()?
+                                .iter()
+                                .filter_map(|value| value.as_str().map(str::to_string))
+                                .collect::<Vec<_>>();
+                            Some((key.clone(), keys))
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    Some((name.clone(), normalize_shortcut_config(&keybindings)))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
 
     let show_table_headers = value
         .get("editor")
@@ -271,6 +435,59 @@ fn app_preferences_from_toml_value(
         .and_then(|value| value.as_str())
         .map(ImagePasteBehavior::from_str)
         .unwrap_or(ImagePasteBehavior::None);
+    let image_paste = value
+        .get("images")
+        .and_then(|images| images.as_table())
+        .map(|table| ImagePasteSettings {
+            asset_dir: table
+                .get("asset_dir")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| ImagePasteSettings::default().asset_dir),
+            naming: table
+                .get("naming")
+                .and_then(|value| value.as_str())
+                .map(ImageNamingStrategy::from_str)
+                .unwrap_or(ImageNamingStrategy::OriginalCounter),
+        })
+        .unwrap_or_default();
+    let which_key = value
+        .get("which_key")
+        .and_then(|which_key| which_key.as_table())
+        .map(|table| WhichKeyPreferences {
+            enable: table
+                .get("enable")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            trigger: table
+                .get("trigger")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .and_then(|keys| normalize_shortcut_keys(&keys))
+                .unwrap_or_else(|| WhichKeyPreferences::default().trigger),
+        })
+        .unwrap_or_default();
+    let markdown_extensions = value
+        .get("markdown_extensions")
+        .and_then(|markdown_extensions| markdown_extensions.as_table())
+        .map(|table| MarkdownExtensionPreferences {
+            frontmatter: table
+                .get("frontmatter")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            wikilinks: table
+                .get("wikilinks")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+        })
+        .unwrap_or_default();
 
     AppPreferences {
         startup_open,
@@ -278,7 +495,12 @@ fn app_preferences_from_toml_value(
         default_theme_id,
         show_table_headers,
         image_paste_behavior,
+        image_paste,
         keybindings,
+        keybinding_profile,
+        keybinding_profiles,
+        which_key,
+        markdown_extensions,
     }
 }
 
@@ -1020,6 +1242,7 @@ impl PreferencesWindow {
             ShortcutCommand::ToggleWorkspace => {
                 strings.preferences_shortcut_toggle_workspace.clone()
             }
+            ShortcutCommand::ToggleWhichKey => "Show keyboard shortcuts".to_string(),
         }
     }
 
@@ -1606,7 +1829,8 @@ pub(crate) fn open_preferences_window(cx: &mut App) -> WindowHandle<PreferencesW
 #[cfg(test)]
 mod tests {
     use super::{
-        AppPreferences, ImagePasteBehavior, StartupOpenPreference,
+        AppPreferences, ImageNamingStrategy, ImagePasteBehavior, ImagePasteSettings,
+        StartupOpenPreference, WhichKeyPreferences,
         load_or_create_app_preferences_with_dirs_and_locales, open_preferences_window_with_state,
         read_app_preferences_with_dirs, save_app_preferences_with_dirs,
         save_preferences_from_window_with_dirs,
@@ -1616,6 +1840,7 @@ mod tests {
     use crate::theme::{ThemeCatalogEntry, ThemeManager};
     use gpui::TestAppContext;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     fn init_preferences_test_app(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1726,7 +1951,18 @@ mod tests {
             default_theme_id: "velotype-light".into(),
             show_table_headers: false,
             image_paste_behavior: ImagePasteBehavior::CopyToAssetsFolder,
+            image_paste: ImagePasteSettings {
+                asset_dir: PathBuf::from("assets/images"),
+                naming: ImageNamingStrategy::SlugCounter,
+            },
             keybindings: BTreeMap::new(),
+            keybinding_profile: Some("writing".into()),
+            keybinding_profiles: BTreeMap::from([(
+                "writing".into(),
+                BTreeMap::from([("toggle_which_key".into(), vec!["ctrl-alt-k".into()])]),
+            )]),
+            which_key: WhichKeyPreferences::default(),
+            markdown_extensions: super::MarkdownExtensionPreferences::default(),
         };
 
         save_app_preferences_with_dirs(&preferences, &dirs)
@@ -1741,7 +1977,45 @@ mod tests {
         assert!(text.contains("default_theme_id = \"velotype-light\""));
         assert!(text.contains("show_table_headers = false"));
         assert!(text.contains("image_paste_behavior = \"copy_to_assets_folder\""));
+        assert!(text.contains("asset_dir = \"assets/images\""));
+        assert!(text.contains("naming = \"slug-counter\""));
+        assert!(text.contains("keybinding_profile = \"writing\""));
+        assert!(text.contains("[keybinding_profiles.writing]"));
+        assert!(text.contains("[which_key]"));
+        assert!(text.contains("[markdown_extensions]"));
+        assert!(text.contains("frontmatter = true"));
+        assert!(text.contains("wikilinks = true"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn effective_keybindings_merge_selected_profile_over_base_bindings() {
+        let preferences = AppPreferences {
+            keybindings: BTreeMap::from([
+                ("save_document".into(), vec!["ctrl-s".into()]),
+                ("toggle_workspace".into(), vec!["ctrl-shift-e".into()]),
+            ]),
+            keybinding_profile: Some("john".into()),
+            keybinding_profiles: BTreeMap::from([(
+                "john".into(),
+                BTreeMap::from([
+                    ("toggle_workspace".into(), vec!["ctrl-e".into()]),
+                    ("toggle_which_key".into(), vec!["ctrl-space".into()]),
+                ]),
+            )]),
+            ..AppPreferences::default()
+        };
+
+        let effective = preferences.effective_keybindings();
+        assert_eq!(effective.get("save_document"), Some(&vec!["ctrl-s".into()]));
+        assert_eq!(
+            effective.get("toggle_workspace"),
+            Some(&vec!["ctrl-e".into()])
+        );
+        assert_eq!(
+            effective.get("toggle_which_key"),
+            Some(&vec!["ctrl-space".into()])
+        );
     }
 
     #[test]
@@ -1810,6 +2084,7 @@ mod tests {
             show_table_headers: true,
             image_paste_behavior: ImagePasteBehavior::None,
             keybindings: BTreeMap::new(),
+            ..AppPreferences::default()
         };
         save_app_preferences_with_dirs(&preferences, &dirs)
             .expect("preferences should save to config.toml");

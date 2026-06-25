@@ -1,6 +1,7 @@
 //! Shared user-configuration helpers for app preferences and imported packs.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context as _, bail};
 use directories::ProjectDirs;
@@ -9,13 +10,89 @@ use serde_json::{Map, Value};
 pub(crate) mod preferences;
 
 pub(crate) use preferences::{
-    EditorSettings, ImagePasteBehavior, StartupOpenPreference, apply_configured_language,
-    apply_configured_theme, first_existing_recent_markdown_file, import_language_config_and_select,
+    EditorSettings, ImageNamingStrategy, ImagePasteBehavior, ImagePasteSettings,
+    StartupOpenPreference, apply_configured_language, apply_configured_theme,
+    first_existing_recent_markdown_file, import_language_config_and_select,
     import_theme_config_and_select, load_or_create_app_preferences, open_preferences_window,
     read_app_preferences,
 };
 
 pub(crate) const RECENT_FILES_LIMIT: usize = 20;
+
+const CONFIG_DIR_ENV: &str = "VELOTYPE_CONFIG_DIR";
+const PROFILE_ENV: &str = "VELOTYPE_PROFILE";
+
+static RUNTIME_CONFIG_PATHS: OnceLock<Mutex<Option<RuntimeConfigPaths>>> = OnceLock::new();
+
+/// Process-level configuration path overrides resolved from CLI flags or env.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeConfigPaths {
+    root: PathBuf,
+    profile: Option<String>,
+}
+
+impl RuntimeConfigPaths {
+    pub(crate) fn new(root: impl Into<PathBuf>, profile: Option<String>) -> anyhow::Result<Self> {
+        let profile = normalize_profile(profile)?;
+        Ok(Self {
+            root: root.into(),
+            profile,
+        })
+    }
+
+    fn config_root(&self) -> PathBuf {
+        match &self.profile {
+            Some(profile) => self.root.join("profiles").join(profile),
+            None => self.root.clone(),
+        }
+    }
+}
+
+fn normalize_profile(profile: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(profile) = profile else {
+        return Ok(None);
+    };
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return Ok(None);
+    }
+    if profile.contains('/') || profile.contains('\\') || profile == "." || profile == ".." {
+        bail!("invalid Velotype profile '{profile}': profiles must be simple names");
+    }
+    Ok(Some(profile.to_string()))
+}
+
+fn runtime_config_paths_cell() -> &'static Mutex<Option<RuntimeConfigPaths>> {
+    RUNTIME_CONFIG_PATHS.get_or_init(|| Mutex::new(None))
+}
+
+/// Installs CLI-resolved config path overrides for this process.
+pub(crate) fn set_runtime_config_paths(paths: RuntimeConfigPaths) {
+    if let Ok(mut guard) = runtime_config_paths_cell().lock() {
+        *guard = Some(paths);
+    }
+}
+
+fn runtime_config_paths_override() -> Option<RuntimeConfigPaths> {
+    runtime_config_paths_cell()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn runtime_config_paths_from_env() -> anyhow::Result<Option<RuntimeConfigPaths>> {
+    let root = std::env::var_os(CONFIG_DIR_ENV).map(PathBuf::from);
+    let profile = std::env::var(PROFILE_ENV).ok();
+    match (root, profile) {
+        (Some(root), profile) => RuntimeConfigPaths::new(root, profile).map(Some),
+        (None, Some(profile)) => {
+            let dirs = ProjectDirs::from("com", "manyougz", "Velotype")
+                .context("failed to resolve the Velotype config directory")?;
+            RuntimeConfigPaths::new(dirs.config_dir().to_path_buf(), Some(profile)).map(Some)
+        }
+        (None, None) => Ok(None),
+    }
+}
 
 /// Cross-platform configuration directories owned by Velotype.
 #[derive(Debug, Clone)]
@@ -30,6 +107,16 @@ impl VelotypeConfigDirs {
     /// language and theme packs are stored under the OS location returned by
     /// `directories::ProjectDirs`.
     pub(crate) fn from_system() -> anyhow::Result<Self> {
+        if let Some(paths) = runtime_config_paths_override() {
+            return Ok(Self {
+                root: paths.config_root(),
+            });
+        }
+        if let Some(paths) = runtime_config_paths_from_env()? {
+            return Ok(Self {
+                root: paths.config_root(),
+            });
+        }
         let dirs = ProjectDirs::from("com", "manyougz", "Velotype")
             .context("failed to resolve the Velotype config directory")?;
         Ok(Self {
@@ -57,6 +144,63 @@ impl VelotypeConfigDirs {
 
     pub(crate) fn app_config_file(&self) -> PathBuf {
         self.root.join("config.toml")
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_runtime_config_paths_for_tests() {
+    if let Ok(mut guard) = runtime_config_paths_cell().lock() {
+        *guard = None;
+    }
+}
+
+#[cfg(test)]
+mod runtime_config_path_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_config_paths_without_profile_use_root() {
+        let paths = RuntimeConfigPaths::new("/tmp/velotype", None).unwrap();
+        assert_eq!(paths.config_root(), PathBuf::from("/tmp/velotype"));
+    }
+
+    #[test]
+    fn runtime_config_paths_with_profile_use_profile_subdir() {
+        let paths = RuntimeConfigPaths::new("/tmp/velotype", Some("john".into())).unwrap();
+        assert_eq!(
+            paths.config_root(),
+            PathBuf::from("/tmp/velotype").join("profiles").join("john")
+        );
+    }
+
+    #[test]
+    fn blank_profile_is_ignored() {
+        let paths = RuntimeConfigPaths::new("/tmp/velotype", Some("  ".into())).unwrap();
+        assert_eq!(paths.config_root(), PathBuf::from("/tmp/velotype"));
+    }
+
+    #[test]
+    fn profile_names_must_be_simple() {
+        assert!(RuntimeConfigPaths::new("/tmp/velotype", Some("../bad".into())).is_err());
+        assert!(RuntimeConfigPaths::new("/tmp/velotype", Some("bad/name".into())).is_err());
+        assert!(RuntimeConfigPaths::new("/tmp/velotype", Some("bad\\name".into())).is_err());
+    }
+
+    #[test]
+    fn velotype_config_dirs_use_process_override() {
+        clear_runtime_config_paths_for_tests();
+        set_runtime_config_paths(
+            RuntimeConfigPaths::new("/tmp/velotype-config", Some("docs".into())).unwrap(),
+        );
+        let dirs = VelotypeConfigDirs::from_system().unwrap();
+        assert_eq!(
+            dirs.app_config_file(),
+            PathBuf::from("/tmp/velotype-config")
+                .join("profiles")
+                .join("docs")
+                .join("config.toml")
+        );
+        clear_runtime_config_paths_for_tests();
     }
 }
 

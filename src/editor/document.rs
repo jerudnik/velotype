@@ -790,6 +790,26 @@ fn raw_block(cx: &mut Context<Editor>, markdown: String) -> Entity<super::Block>
     Editor::new_block(cx, BlockRecord::raw_markdown(markdown))
 }
 
+fn collect_frontmatter_block(
+    cx: &mut Context<Editor>,
+    lines: &[String],
+    start: usize,
+) -> Option<(Entity<super::Block>, usize)> {
+    if start != 0 || lines.get(start).map(|line| line.trim()) != Some("---") {
+        return None;
+    }
+    let closing = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(index, line)| (line.trim() == "---").then_some(index))
+        .unwrap_or(lines.len().saturating_sub(1));
+    Some((
+        raw_block(cx, lines[start..=closing].join("\n")),
+        closing + 1,
+    ))
+}
+
 fn comment_block(cx: &mut Context<Editor>, markdown: String) -> Entity<super::Block> {
     Editor::new_block(cx, BlockRecord::comment(markdown))
 }
@@ -957,6 +977,11 @@ impl Editor {
 
         while index < lines.len() {
             let line = &lines[index];
+            if let Some((block, end)) = collect_frontmatter_block(cx, lines, index) {
+                roots.push(block);
+                index = end;
+                continue;
+            }
             if line.trim().is_empty() {
                 let blank_start = index;
                 while index < lines.len() && lines[index].trim().is_empty() {
@@ -3975,6 +4000,46 @@ mod tests {
             assert_eq!(visible[0].entity.read(cx).kind(), BlockKind::Paragraph);
             assert_eq!(visible[0].entity.read(cx).display_text(), "");
             assert_eq!(editor.document.markdown_text(cx), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn preserves_yaml_frontmatter_across_round_trip(cx: &mut TestAppContext) {
+        let markdown = "---\ntitle: Example\ntags:\n  - notes\n---\n\n# Body";
+        let editor = cx.new(|cx| Editor::from_markdown(cx, markdown.to_string(), None));
+
+        editor.update(cx, |editor, cx| {
+            assert_eq!(editor.document.markdown_text(cx), markdown);
+        });
+    }
+
+    #[gpui::test]
+    async fn preserves_wikilinks_across_round_trip(cx: &mut TestAppContext) {
+        let markdown = "Link to [[Project Notes]] and [[Target Page|display text]].";
+        let editor = cx.new(|cx| Editor::from_markdown(cx, markdown.to_string(), None));
+
+        editor.update(cx, |editor, cx| {
+            assert_eq!(editor.document.markdown_text(cx), markdown);
+        });
+    }
+
+    #[gpui::test]
+    async fn preserves_frontmatter_and_wikilinks_together(cx: &mut TestAppContext) {
+        let markdown = "---\ntitle: Project Notes\n---\n\nSee [[Roadmap|the roadmap]].";
+        let editor = cx.new(|cx| Editor::from_markdown(cx, markdown.to_string(), None));
+
+        editor.update(cx, |editor, cx| {
+            assert_eq!(editor.document.markdown_text(cx), markdown);
+        });
+    }
+
+    #[gpui::test]
+    async fn unclosed_frontmatter_marker_round_trips_as_plain_markdown(cx: &mut TestAppContext) {
+        let markdown = "---\ntitle: Missing close\n\n# Body with [[Wiki Link]]";
+        let editor = cx.new(|cx| Editor::from_markdown(cx, markdown.to_string(), None));
+
+        editor.update(cx, |editor, cx| {
+            assert_eq!(editor.document.markdown_text(cx), markdown);
         });
     }
 }

@@ -18,7 +18,9 @@ use crate::components::{
     OutdentBlock, PastedImageSource, TableCellPosition, is_table_row_candidate,
     parse_root_table_region, parse_table_body_row,
 };
-use crate::config::{ImagePasteBehavior, read_app_preferences};
+use crate::config::{
+    ImageNamingStrategy, ImagePasteBehavior, ImagePasteSettings, read_app_preferences,
+};
 
 impl Editor {
     fn focused_block_for_tab_key(
@@ -238,6 +240,12 @@ impl Editor {
             .unwrap_or(ImagePasteBehavior::None)
     }
 
+    fn current_image_paste_settings() -> ImagePasteSettings {
+        read_app_preferences()
+            .map(|preferences| preferences.image_paste)
+            .unwrap_or_default()
+    }
+
     fn image_paste_root_dir(&self) -> anyhow::Result<PathBuf> {
         if let Some(parent) = self.file_path.as_ref().and_then(|path| path.parent()) {
             return Ok(parent.to_path_buf());
@@ -260,6 +268,7 @@ impl Editor {
     fn image_target_dir(
         &self,
         behavior: ImagePasteBehavior,
+        settings: &ImagePasteSettings,
         root_dir: &Path,
         source: &PastedImageSource,
     ) -> anyhow::Result<PathBuf> {
@@ -267,7 +276,7 @@ impl Editor {
             ImagePasteBehavior::None | ImagePasteBehavior::CopyToDocumentFolder => {
                 Ok(root_dir.to_path_buf())
             }
-            ImagePasteBehavior::CopyToAssetsFolder => Ok(root_dir.join("assets")),
+            ImagePasteBehavior::CopyToAssetsFolder => Ok(root_dir.join(&settings.asset_dir)),
             ImagePasteBehavior::CopyToNamedAssetsFolder => {
                 let base = self
                     .file_path
@@ -323,6 +332,54 @@ impl Editor {
         unreachable!("unbounded search should always return");
     }
 
+    fn slugify_image_stem(value: &str) -> String {
+        let mut slug = String::new();
+        let mut pending_dash = false;
+        for ch in value.chars().flat_map(char::to_lowercase) {
+            if ch.is_ascii_alphanumeric() {
+                if pending_dash && !slug.is_empty() {
+                    slug.push('-');
+                }
+                pending_dash = false;
+                slug.push(ch);
+            } else if !slug.is_empty() {
+                pending_dash = true;
+            }
+        }
+        if slug.is_empty() {
+            "image".into()
+        } else {
+            slug
+        }
+    }
+
+    fn slugged_file_name(preferred_name: &str, fallback_stem: &str) -> String {
+        let preferred = Path::new(preferred_name);
+        let stem = preferred
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.trim().is_empty())
+            .unwrap_or(fallback_stem);
+        let stem = Self::slugify_image_stem(stem);
+        match preferred.extension().and_then(|ext| ext.to_str()) {
+            Some(extension) if !extension.is_empty() => format!("{stem}.{extension}"),
+            _ => stem,
+        }
+    }
+
+    fn configured_file_name(
+        settings: &ImagePasteSettings,
+        preferred_name: &str,
+        fallback_stem: &str,
+    ) -> String {
+        match settings.naming {
+            ImageNamingStrategy::OriginalCounter => preferred_name.to_string(),
+            ImageNamingStrategy::SlugCounter => {
+                Self::slugged_file_name(preferred_name, fallback_stem)
+            }
+        }
+    }
+
     fn path_parent_eq(left: &Path, right: &Path) -> bool {
         let Some(parent) = left.parent() else {
             return false;
@@ -339,6 +396,7 @@ impl Editor {
         source: &PastedImageSource,
     ) -> anyhow::Result<(PathBuf, bool)> {
         let behavior = Self::current_image_paste_behavior();
+        let settings = Self::current_image_paste_settings();
         let root_dir = self.image_paste_root_dir()?;
 
         if matches!(behavior, ImagePasteBehavior::None)
@@ -347,7 +405,7 @@ impl Editor {
             return Ok((path.clone(), false));
         }
 
-        let target_dir = self.image_target_dir(behavior, &root_dir, source)?;
+        let target_dir = self.image_target_dir(behavior, &settings, &root_dir, source)?;
         fs::create_dir_all(&target_dir)
             .with_context(|| format!("failed to create '{}'", target_dir.display()))?;
 
@@ -360,7 +418,10 @@ impl Editor {
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("image");
-                let target = Self::unique_file_path(&target_dir, file_name);
+                let target = Self::unique_file_path(
+                    &target_dir,
+                    &Self::configured_file_name(&settings, file_name, "image"),
+                );
                 fs::copy(path, &target).with_context(|| {
                     format!(
                         "failed to copy '{}' to '{}'",
@@ -375,7 +436,16 @@ impl Editor {
                     "pasted-image.{}",
                     Self::clipboard_image_extension(image.format)
                 );
-                let target = Self::unique_file_path(&target_dir, &file_name);
+                let fallback = self
+                    .file_path
+                    .as_ref()
+                    .and_then(|path| path.file_stem())
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("pasted-image");
+                let target = Self::unique_file_path(
+                    &target_dir,
+                    &Self::configured_file_name(&settings, &file_name, fallback),
+                );
                 fs::write(&target, &image.bytes)
                     .with_context(|| format!("failed to write '{}'", target.display()))?;
                 Ok((target, behavior != ImagePasteBehavior::None))
@@ -2323,7 +2393,35 @@ mod tests {
         Block, BlockEvent, BlockKind, BlockRecord, CalloutVariant, Delete, DeleteBack,
         ExitCodeBlock, InlineTextTree, Newline,
     };
+    use crate::config::{ImageNamingStrategy, ImagePasteSettings};
     use gpui::{App, AppContext, Entity, TestAppContext};
+    use std::path::PathBuf;
+
+    #[test]
+    fn slug_counter_image_naming_normalizes_file_stems() {
+        let settings = ImagePasteSettings {
+            asset_dir: PathBuf::from("assets/images"),
+            naming: ImageNamingStrategy::SlugCounter,
+        };
+
+        assert_eq!(
+            Editor::configured_file_name(&settings, "Screenshot 2026-06-19!.PNG", "note"),
+            "screenshot-2026-06-19.PNG"
+        );
+        assert_eq!(
+            Editor::configured_file_name(&settings, "!!!.png", "note"),
+            "image.png"
+        );
+    }
+
+    #[test]
+    fn original_counter_image_naming_preserves_file_name() {
+        let settings = ImagePasteSettings::default();
+        assert_eq!(
+            Editor::configured_file_name(&settings, "Screenshot 1.png", "note"),
+            "Screenshot 1.png"
+        );
+    }
 
     #[gpui::test]
     async fn request_quote_break_creates_new_root_leaf_quote_group(cx: &mut TestAppContext) {

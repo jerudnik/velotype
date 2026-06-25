@@ -1,0 +1,21 @@
+# Fork rail configuration for 4nix tooling (fork-sync / fork-status / fork-doctor).
+#
+# Consumed by:
+#   nix run github:jerudnik/4nix-utilities#fork-sync
+#   nix run github:jerudnik/4nix-utilities#fork-status
+#   nix run github:jerudnik/4nix-utilities#fork-doctor
+#
+# Each value can also be overridden by the matching env var (see fork-sync -h).
+[fork]
+# Git remote that points at YOUR fork (the only writer; CI-reconciled).
+fork-remote = "github"
+# Git remote that points at the UPSTREAM project you forked.
+upstream-remote = "upstream"
+# Upstream's default branch (often "main" or "master").
+upstream-branch = "main"
+# The three rails.
+vendor-branch = "vendor/upstream"
+packaging-branch = "distro/nix"
+main-branch = "main"
+# "owner/name" of your fork on GitHub, used for PR/CI summaries in fork-status.
+fork-repo = "jerudnik/velotype"

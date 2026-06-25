@@ -70,7 +70,14 @@ jobs:
           skipPush: true
 
       - name: Check workflow syntax
-        run: nix run nixpkgs#actionlint -- .github/workflows/*.yml
+        # Lint only the fork-owned workflows. Upstream's own workflows are not
+        # this fork's concern and may use older actions/shell that would fail
+        # actionlint; gating CI on them would block the fork for upstream's debt.
+        run: |
+          nix run nixpkgs#actionlint -- \
+            .github/workflows/nix.yml \
+            .github/workflows/nix-update.yml \
+            .github/workflows/fork-maintenance.yml
 
       - name: Dry-run Linux package
         run: nix build .#packages.x86_64-linux.velotype --dry-run --print-build-logs

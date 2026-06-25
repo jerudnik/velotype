@@ -26,6 +26,8 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@main
 
       - name: Cachix (read-only public binary cache)
+        # Non-fatal until the cache exists (a one-time `cachix create` step).
+        continue-on-error: true
         uses: cachix/cachix-action@v17
         with:
           name: jerudnik-velotype

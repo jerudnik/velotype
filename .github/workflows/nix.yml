@@ -61,6 +61,9 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@main
 
       - name: Cachix (read-only public binary cache)
+        # Non-fatal: the cache may not exist yet (one-time `cachix create
+        # jerudnik-velotype`). Skip caching rather than fail CI until it does.
+        continue-on-error: true
         uses: cachix/cachix-action@v17
         with:
           name: jerudnik-velotype
@@ -114,6 +117,8 @@ jobs:
 
       - name: Cachix (read-only public binary cache)
         if: env.CACHIX_CAN_PUSH != 'true'
+        # Non-fatal until the cache exists (see the validate job for rationale).
+        continue-on-error: true
         uses: cachix/cachix-action@v17
         with:
           name: jerudnik-velotype
